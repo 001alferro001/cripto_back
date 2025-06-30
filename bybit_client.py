@@ -19,6 +19,7 @@ class BybitWebSocketClient:
         self.ping_task = None
         self.subscription_update_task = None
         self.last_message_time = None
+        self.websocket_connected = False  # Добавляем флаг состояния соединения
 
         # Bybit WebSocket URLs
         self.ws_url = "wss://stream.bybit.com/v5/public/linear"
@@ -267,7 +268,7 @@ class BybitWebSocketClient:
         # Ждем установления соединения
         max_wait = 30  # максимум 30 секунд
         wait_time = 0
-        while not self.websocket or not self.websocket.open:
+        while not self.websocket_connected:
             await asyncio.sleep(1)
             wait_time += 1
             if wait_time >= max_wait:
@@ -282,6 +283,7 @@ class BybitWebSocketClient:
                 await self._connect_websocket()
             except Exception as e:
                 logger.error(f"❌ WebSocket ошибка: {e}")
+                self.websocket_connected = False
                 if self.is_running:
                     logger.info("🔄 Переподключение через 5 секунд...")
                     await asyncio.sleep(5)
@@ -298,6 +300,7 @@ class BybitWebSocketClient:
                     close_timeout=10
             ) as websocket:
                 self.websocket = websocket
+                self.websocket_connected = True
                 self.last_message_time = datetime.utcnow()
 
                 # Сбрасываем отслеживание подписок
@@ -347,8 +350,10 @@ class BybitWebSocketClient:
 
         except Exception as e:
             logger.error(f"❌ Ошибка WebSocket соединения: {e}")
+            self.websocket_connected = False
             raise
         finally:
+            self.websocket_connected = False
             if self.ping_task:
                 self.ping_task.cancel()
 
@@ -422,7 +427,7 @@ class BybitWebSocketClient:
                         await self._load_data_for_new_pairs(new_pairs)
 
                     # Если WebSocket активен, обновляем подписки
-                    if self.websocket and self.websocket.open:
+                    if self.websocket_connected:
                         await self._update_subscriptions(new_pairs, removed_pairs)
 
                     logger.info("✅ Обновление списка пар завершено")
@@ -664,6 +669,7 @@ class BybitWebSocketClient:
     async def stop(self):
         """Остановка WebSocket соединения"""
         self.is_running = False
+        self.websocket_connected = False
         if self.ping_task:
             self.ping_task.cancel()
         if self.subscription_update_task:
@@ -682,5 +688,6 @@ class BybitWebSocketClient:
             'subscription_rate': len(self.subscribed_pairs) / len(
                 self.trading_pairs) * 100 if self.trading_pairs else 0,
             'data_loading_complete': self.data_loading_complete,
-            'initial_subscription_complete': self.initial_subscription_complete
+            'initial_subscription_complete': self.initial_subscription_complete,
+            'websocket_connected': self.websocket_connected
         }
