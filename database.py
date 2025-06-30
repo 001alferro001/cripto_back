@@ -687,6 +687,25 @@ class DatabaseManager:
             logger.error(f"Ошибка сохранения алерта: {e}")
             return None
 
+    def _parse_json_field(self, field_value):
+        """Безопасное парсинг JSON поля"""
+        if field_value is None:
+            return None
+        
+        # Если это уже словарь/список Python, возвращаем как есть
+        if isinstance(field_value, (dict, list)):
+            return field_value
+        
+        # Если это строка, пытаемся распарсить JSON
+        if isinstance(field_value, str):
+            try:
+                return json.loads(field_value)
+            except (json.JSONDecodeError, ValueError):
+                logger.warning(f"Не удалось распарсить JSON: {field_value}")
+                return None
+        
+        return None
+
     async def get_all_alerts(self, limit: int = 1000) -> Dict:
         """Получение всех алертов"""
         try:
@@ -721,15 +740,12 @@ class DatabaseManager:
 
             cursor.close()
 
-            # Преобразуем JSON поля обратно в объекты
+            # Безопасно преобразуем JSON поля
             for alerts_list in [volume_alerts, consecutive_alerts, priority_alerts]:
                 for alert in alerts_list:
-                    if alert.get('imbalance_data'):
-                        alert['imbalance_data'] = json.loads(alert['imbalance_data'])
-                    if alert.get('candle_data'):
-                        alert['candle_data'] = json.loads(alert['candle_data'])
-                    if alert.get('order_book_snapshot'):
-                        alert['order_book_snapshot'] = json.loads(alert['order_book_snapshot'])
+                    alert['imbalance_data'] = self._parse_json_field(alert.get('imbalance_data'))
+                    alert['candle_data'] = self._parse_json_field(alert.get('candle_data'))
+                    alert['order_book_snapshot'] = self._parse_json_field(alert.get('order_book_snapshot'))
 
             return {
                 'volume_alerts': volume_alerts,
@@ -763,7 +779,15 @@ class DatabaseManager:
             rows = cursor.fetchall()
             cursor.close()
 
-            return [dict(row) for row in rows]
+            alerts = []
+            for row in rows:
+                alert = dict(row)
+                alert['imbalance_data'] = self._parse_json_field(alert.get('imbalance_data'))
+                alert['candle_data'] = self._parse_json_field(alert.get('candle_data'))
+                alert['order_book_snapshot'] = self._parse_json_field(alert.get('order_book_snapshot'))
+                alerts.append(alert)
+
+            return alerts
 
         except Exception as e:
             logger.error(f"Ошибка получения недавних алертов по объему для {symbol}: {e}")
@@ -1168,13 +1192,10 @@ class DatabaseManager:
             alerts = []
             for row in rows:
                 alert = dict(row)
-                # Преобразуем JSON поля
-                if alert.get('imbalance_data'):
-                    alert['imbalance_data'] = json.loads(alert['imbalance_data'])
-                if alert.get('candle_data'):
-                    alert['candle_data'] = json.loads(alert['candle_data'])
-                if alert.get('order_book_snapshot'):
-                    alert['order_book_snapshot'] = json.loads(alert['order_book_snapshot'])
+                # Безопасно преобразуем JSON поля
+                alert['imbalance_data'] = self._parse_json_field(alert.get('imbalance_data'))
+                alert['candle_data'] = self._parse_json_field(alert.get('candle_data'))
+                alert['order_book_snapshot'] = self._parse_json_field(alert.get('order_book_snapshot'))
                 alerts.append(alert)
 
             return alerts
