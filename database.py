@@ -54,7 +54,7 @@ class DatabaseManager:
                 )
             """)
 
-            # Таблица свечных данных
+            # Таблица исторических свечных данных (закрытые свечи)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS kline_data (
                     id SERIAL PRIMARY KEY,
@@ -68,7 +68,28 @@ class DatabaseManager:
                     volume DECIMAL(20, 8) NOT NULL,
                     volume_usdt DECIMAL(20, 8) NOT NULL,
                     is_long BOOLEAN NOT NULL,
+                    is_closed BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(symbol, open_time_ms)
+                )
+            """)
+
+            # Новая таблица для потоковых данных (формирующиеся свечи)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS streaming_kline_data (
+                    id SERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    open_time_ms BIGINT NOT NULL,
+                    close_time_ms BIGINT NOT NULL,
+                    open_price DECIMAL(20, 8) NOT NULL,
+                    high_price DECIMAL(20, 8) NOT NULL,
+                    low_price DECIMAL(20, 8) NOT NULL,
+                    close_price DECIMAL(20, 8) NOT NULL,
+                    volume DECIMAL(20, 8) NOT NULL,
+                    volume_usdt DECIMAL(20, 8) NOT NULL,
+                    is_long BOOLEAN NOT NULL,
                     is_closed BOOLEAN DEFAULT FALSE,
+                    last_updated TIMESTAMPTZ DEFAULT NOW(),
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE(symbol, open_time_ms)
                 )
@@ -83,6 +104,16 @@ class DatabaseManager:
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_kline_symbol_closed 
                 ON kline_data(symbol, is_closed, open_time_ms DESC)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_streaming_kline_symbol_time 
+                ON streaming_kline_data(symbol, open_time_ms DESC)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_streaming_kline_last_updated 
+                ON streaming_kline_data(last_updated DESC)
             """)
 
             # Таблица алертов
@@ -178,8 +209,8 @@ class DatabaseManager:
             logger.error(f"Ошибка создания таблиц: {e}")
             raise
 
-    async def save_kline_data(self, symbol: str, kline_data: Dict, is_closed: bool = False):
-        """Сохранение данных свечи"""
+    async def save_historical_kline_data(self, symbol: str, kline_data: Dict):
+        """Сохранение исторических данных свечи (только закрытые свечи)"""
         try:
             cursor = self.connection.cursor()
 
@@ -209,15 +240,92 @@ class DatabaseManager:
                     is_long = EXCLUDED.is_long,
                     is_closed = EXCLUDED.is_closed
             """, (symbol, open_time_ms, close_time_ms, open_price, high_price,
-                  low_price, close_price, volume, volume_usdt, is_long, is_closed))
+                  low_price, close_price, volume, volume_usdt, is_long, True))
+
+            cursor.close()
+            logger.debug(f"Сохранены исторические данные для {symbol}: {open_time_ms}")
+
+        except Exception as e:
+            logger.error(f"Ошибка сохранения исторических данных свечи для {symbol}: {e}")
+
+    async def save_streaming_kline_data(self, symbol: str, kline_data: Dict, is_closed: bool = False):
+        """Сохранение потоковых данных свечи"""
+        try:
+            cursor = self.connection.cursor()
+
+            open_time_ms = int(kline_data['start'])
+            close_time_ms = int(kline_data['end'])
+            open_price = float(kline_data['open'])
+            high_price = float(kline_data['high'])
+            low_price = float(kline_data['low'])
+            close_price = float(kline_data['close'])
+            volume = float(kline_data['volume'])
+            volume_usdt = volume * close_price
+            is_long = close_price > open_price
+
+            if is_closed:
+                # Если свеча закрылась, перемещаем её в основную таблицу и удаляем из потоковой
+                cursor.execute("""
+                    INSERT INTO kline_data (
+                        symbol, open_time_ms, close_time_ms, open_price, high_price, 
+                        low_price, close_price, volume, volume_usdt, is_long, is_closed
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (symbol, open_time_ms) 
+                    DO UPDATE SET
+                        close_time_ms = EXCLUDED.close_time_ms,
+                        high_price = EXCLUDED.high_price,
+                        low_price = EXCLUDED.low_price,
+                        close_price = EXCLUDED.close_price,
+                        volume = EXCLUDED.volume,
+                        volume_usdt = EXCLUDED.volume_usdt,
+                        is_long = EXCLUDED.is_long,
+                        is_closed = EXCLUDED.is_closed
+                """, (symbol, open_time_ms, close_time_ms, open_price, high_price,
+                      low_price, close_price, volume, volume_usdt, is_long, True))
+
+                # Удаляем из потоковой таблицы
+                cursor.execute("""
+                    DELETE FROM streaming_kline_data 
+                    WHERE symbol = %s AND open_time_ms = %s
+                """, (symbol, open_time_ms))
+
+                logger.debug(f"Закрытая свеча перемещена в основную таблицу: {symbol} {open_time_ms}")
+            else:
+                # Обновляем потоковые данные
+                cursor.execute("""
+                    INSERT INTO streaming_kline_data (
+                        symbol, open_time_ms, close_time_ms, open_price, high_price, 
+                        low_price, close_price, volume, volume_usdt, is_long, is_closed, last_updated
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (symbol, open_time_ms) 
+                    DO UPDATE SET
+                        close_time_ms = EXCLUDED.close_time_ms,
+                        high_price = EXCLUDED.high_price,
+                        low_price = EXCLUDED.low_price,
+                        close_price = EXCLUDED.close_price,
+                        volume = EXCLUDED.volume,
+                        volume_usdt = EXCLUDED.volume_usdt,
+                        is_long = EXCLUDED.is_long,
+                        last_updated = NOW()
+                """, (symbol, open_time_ms, close_time_ms, open_price, high_price,
+                      low_price, close_price, volume, volume_usdt, is_long, False))
+
+                logger.debug(f"Обновлены потоковые данные для {symbol}: {open_time_ms}")
 
             cursor.close()
 
         except Exception as e:
-            logger.error(f"Ошибка сохранения данных свечи для {symbol}: {e}")
+            logger.error(f"Ошибка сохранения потоковых данных свечи для {symbol}: {e}")
+
+    async def save_kline_data(self, symbol: str, kline_data: Dict, is_closed: bool = False):
+        """Универсальный метод сохранения данных свечи"""
+        if is_closed:
+            await self.save_streaming_kline_data(symbol, kline_data, is_closed=True)
+        else:
+            await self.save_streaming_kline_data(symbol, kline_data, is_closed=False)
 
     async def get_recent_candles(self, symbol: str, count: int = 20) -> List[Dict]:
-        """Получение последних свечей для символа"""
+        """Получение последних свечей для символа (только закрытые)"""
         try:
             cursor = self.connection.cursor(cursor_factory=RealDictCursor)
 
@@ -261,6 +369,91 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Ошибка получения последних свечей для {symbol}: {e}")
             return []
+
+    async def get_streaming_candles(self, symbol: str = None) -> List[Dict]:
+        """Получение текущих потоковых свечей"""
+        try:
+            cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+
+            if symbol:
+                cursor.execute("""
+                    SELECT 
+                        symbol,
+                        open_time_ms as timestamp,
+                        open_price as open,
+                        high_price as high,
+                        low_price as low,
+                        close_price as close,
+                        volume,
+                        volume_usdt,
+                        is_long,
+                        is_closed,
+                        last_updated
+                    FROM streaming_kline_data 
+                    WHERE symbol = %s
+                    ORDER BY open_time_ms DESC
+                """, (symbol,))
+            else:
+                cursor.execute("""
+                    SELECT 
+                        symbol,
+                        open_time_ms as timestamp,
+                        open_price as open,
+                        high_price as high,
+                        low_price as low,
+                        close_price as close,
+                        volume,
+                        volume_usdt,
+                        is_long,
+                        is_closed,
+                        last_updated
+                    FROM streaming_kline_data 
+                    ORDER BY last_updated DESC
+                """)
+
+            rows = cursor.fetchall()
+            cursor.close()
+
+            candles = []
+            for row in rows:
+                candles.append({
+                    'symbol': row['symbol'],
+                    'timestamp': int(row['timestamp']),
+                    'open': float(row['open']),
+                    'high': float(row['high']),
+                    'low': float(row['low']),
+                    'close': float(row['close']),
+                    'volume': float(row['volume']),
+                    'volume_usdt': float(row['volume_usdt']),
+                    'is_long': row['is_long'],
+                    'is_closed': row['is_closed'],
+                    'last_updated': row['last_updated']
+                })
+
+            return candles
+
+        except Exception as e:
+            logger.error(f"Ошибка получения потоковых свечей: {e}")
+            return []
+
+    async def check_candle_exists(self, symbol: str, timestamp_ms: int) -> bool:
+        """Проверка существования свечи в основной таблице"""
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("""
+                SELECT 1 FROM kline_data 
+                WHERE symbol = %s AND open_time_ms = %s
+                LIMIT 1
+            """, (symbol, timestamp_ms))
+
+            result = cursor.fetchone()
+            cursor.close()
+
+            return result is not None
+
+        except Exception as e:
+            logger.error(f"Ошибка проверки существования свечи: {e}")
+            return False
 
     async def get_historical_long_volumes(self, symbol: str, hours: int, offset_minutes: int = 0,
                                           volume_type: str = 'long') -> List[float]:
@@ -309,16 +502,26 @@ class DatabaseManager:
             # Рассчитываем время отсечения
             cutoff_time_ms = int((datetime.now(timezone.utc) - timedelta(hours=retention_hours)).timestamp() * 1000)
 
+            # Очищаем основную таблицу
             cursor.execute("""
                 DELETE FROM kline_data 
                 WHERE symbol = %s AND open_time_ms < %s
             """, (symbol, cutoff_time_ms))
 
             deleted_count = cursor.rowcount
+
+            # Очищаем старые потоковые данные (старше 1 часа)
+            stream_cutoff_time_ms = int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000)
+            cursor.execute("""
+                DELETE FROM streaming_kline_data 
+                WHERE symbol = %s AND open_time_ms < %s
+            """, (symbol, stream_cutoff_time_ms))
+
+            deleted_stream_count = cursor.rowcount
             cursor.close()
 
-            if deleted_count > 0:
-                logger.debug(f"Удалено {deleted_count} старых свечей для {symbol}")
+            if deleted_count > 0 or deleted_stream_count > 0:
+                logger.debug(f"Удалено {deleted_count} старых свечей и {deleted_stream_count} потоковых данных для {symbol}")
 
         except Exception as e:
             logger.error(f"Ошибка очистки старых свечей для {symbol}: {e}")
@@ -636,6 +839,11 @@ class DatabaseManager:
             cursor.execute("DELETE FROM kline_data WHERE open_time_ms < %s", (cutoff_time_ms,))
             deleted_candles = cursor.rowcount
 
+            # Очистка старых потоковых данных (старше 2 часов)
+            stream_cutoff_time_ms = int((datetime.now(timezone.utc) - timedelta(hours=2)).timestamp() * 1000)
+            cursor.execute("DELETE FROM streaming_kline_data WHERE open_time_ms < %s", (stream_cutoff_time_ms,))
+            deleted_stream = cursor.rowcount
+
             # Очистка старых алертов (старше 7 дней)
             alert_cutoff_ms = int((datetime.now(timezone.utc) - timedelta(days=7)).timestamp() * 1000)
             cursor.execute("DELETE FROM alerts WHERE alert_timestamp_ms < %s", (alert_cutoff_ms,))
@@ -643,7 +851,7 @@ class DatabaseManager:
 
             cursor.close()
 
-            logger.info(f"Очищено {deleted_candles} старых свечей и {deleted_alerts} старых алертов")
+            logger.info(f"Очищено {deleted_candles} старых свечей, {deleted_stream} потоковых данных и {deleted_alerts} старых алертов")
 
         except Exception as e:
             logger.error(f"Ошибка очистки старых данных: {e}")

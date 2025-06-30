@@ -138,7 +138,12 @@ class BybitWebSocketClient:
 
                     # Загружаем пары в пакете параллельно
                     tasks = [self._load_symbol_data(symbol, total_hours_needed) for symbol in batch]
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # Проверяем результаты
+                    for j, result in enumerate(results):
+                        if isinstance(result, Exception):
+                            logger.error(f"❌ Ошибка загрузки данных для {batch[j]}: {result}")
 
                     # Небольшая пауза между пакетами
                     if i + batch_size < len(pairs_to_load):
@@ -162,12 +167,18 @@ class BybitWebSocketClient:
             start_time_ms = end_time_ms - (hours * 60 * 60 * 1000)
 
             # Загружаем данные с биржи
-            await self._load_full_period(symbol, start_time_ms, end_time_ms)
+            success = await self._load_full_period(symbol, start_time_ms, end_time_ms)
+            
+            if success:
+                logger.debug(f"✅ Данные для {symbol} загружены успешно")
+            else:
+                logger.warning(f"⚠️ Не удалось загрузить данные для {symbol}")
 
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки данных для {symbol}: {e}")
+            raise
 
-    async def _load_full_period(self, symbol: str, start_time_ms: int, end_time_ms: int):
+    async def _load_full_period(self, symbol: str, start_time_ms: int, end_time_ms: int) -> bool:
         """Загрузка полного периода данных"""
         try:
             hours = (end_time_ms - start_time_ms) / (60 * 60 * 1000)
@@ -184,67 +195,64 @@ class BybitWebSocketClient:
             }
 
             response = requests.get(url, params=params, timeout=10)
+            
+            if response.status_code != 200:
+                logger.error(f"❌ HTTP ошибка {response.status_code} для {symbol}")
+                return False
+                
             data = response.json()
 
             if data.get('retCode') == 0:
                 klines = data['result']['list']
+                if not klines:
+                    logger.warning(f"⚠️ Нет данных для {symbol}")
+                    return False
+                    
                 klines.reverse()  # Bybit возвращает данные в обратном порядке
 
                 saved_count = 0
                 skipped_count = 0
 
                 for kline in klines:
-                    # Биржа передает время в миллисекундах
-                    kline_timestamp_ms = int(kline[0])
+                    try:
+                        # Биржа передает время в миллисекундах
+                        kline_timestamp_ms = int(kline[0])
 
-                    # Для исторических данных округляем до минут
-                    rounded_timestamp = (kline_timestamp_ms // 60000) * 60000
+                        # Для исторических данных округляем до минут
+                        rounded_timestamp = (kline_timestamp_ms // 60000) * 60000
 
-                    kline_data = {
-                        'start': rounded_timestamp,
-                        'end': rounded_timestamp + 60000,
-                        'open': kline[1],
-                        'high': kline[2],
-                        'low': kline[3],
-                        'close': kline[4],
-                        'volume': kline[5],
-                        'confirm': True  # Исторические данные всегда закрыты
-                    }
+                        kline_data = {
+                            'start': rounded_timestamp,
+                            'end': rounded_timestamp + 60000,
+                            'open': float(kline[1]),
+                            'high': float(kline[2]),
+                            'low': float(kline[3]),
+                            'close': float(kline[4]),
+                            'volume': float(kline[5]),
+                            'confirm': True  # Исторические данные всегда закрыты
+                        }
 
-                    # Проверяем, есть ли уже эта свеча в базе
-                    existing = await self._check_candle_exists(symbol, rounded_timestamp)
-                    if not existing:
-                        # Сохраняем как закрытую свечу
-                        await self.alert_manager.db_manager.save_kline_data(symbol, kline_data, is_closed=True)
-                        saved_count += 1
-                    else:
-                        skipped_count += 1
+                        # Проверяем, есть ли уже эта свеча в базе
+                        existing = await self.alert_manager.db_manager.check_candle_exists(symbol, rounded_timestamp)
+                        if not existing:
+                            # Сохраняем как исторические данные
+                            await self.alert_manager.db_manager.save_historical_kline_data(symbol, kline_data)
+                            saved_count += 1
+                        else:
+                            skipped_count += 1
+                            
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка обработки свечи для {symbol}: {e}")
+                        continue
 
-                logger.debug(
-                    f"📊 {symbol}: Загружено {saved_count} новых свечей, пропущено {skipped_count} существующих")
+                logger.info(f"📊 {symbol}: Загружено {saved_count} новых свечей, пропущено {skipped_count} существующих")
+                return True
             else:
                 logger.error(f"❌ Ошибка API при загрузке данных для {symbol}: {data.get('retMsg')}")
+                return False
 
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки полного периода для {symbol}: {e}")
-
-    async def _check_candle_exists(self, symbol: str, timestamp_ms: int) -> bool:
-        """Проверка существования свечи в базе данных"""
-        try:
-            cursor = self.alert_manager.db_manager.connection.cursor()
-            cursor.execute("""
-                SELECT 1 FROM kline_data 
-                WHERE symbol = %s AND open_time_ms = %s
-                LIMIT 1
-            """, (symbol, timestamp_ms))
-
-            result = cursor.fetchone()
-            cursor.close()
-
-            return result is not None
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка проверки существования свечи: {e}")
             return False
 
     async def _connect_and_subscribe(self):
@@ -566,7 +574,7 @@ class BybitWebSocketClient:
                 if is_closed:
                     await self._process_closed_candle(symbol, formatted_data)
 
-                # Сохраняем данные в базу (формирующиеся или закрытые)
+                # Сохраняем данные в базу (потоковые или закрытые)
                 await self.alert_manager.db_manager.save_kline_data(symbol, formatted_data, is_closed)
 
                 # Отправляем обновление данных клиентам (потоковые данные)

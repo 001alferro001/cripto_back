@@ -268,6 +268,15 @@ async def get_stats():
         if bybit_client:
             subscription_stats = bybit_client.get_subscription_stats()
 
+        # Добавляем статистику потоковых данных
+        streaming_stats = {}
+        if db_manager:
+            streaming_candles = await db_manager.get_streaming_candles()
+            streaming_stats = {
+                'active_streams': len(streaming_candles),
+                'symbols_streaming': len(set(candle['symbol'] for candle in streaming_candles))
+            }
+
         return {
             "pairs_count": len(watchlist),
             "favorites_count": len(favorites),
@@ -277,12 +286,32 @@ async def get_stats():
             "priority_alerts_count": len(alerts_data.get('priority_alerts', [])),
             "trading_stats": trading_stats,
             "subscription_stats": subscription_stats,
+            "streaming_stats": streaming_stats,
             "last_update": datetime.now(timezone.utc).isoformat(),
             "system_status": "running",
             "time_sync": time_sync_info
         }
     except Exception as e:
         logger.error(f"Ошибка получения статистики: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/api/streaming-data")
+async def get_streaming_data(symbol: str = None):
+    """Получить текущие потоковые данные"""
+    try:
+        if not db_manager:
+            return {"error": "Database not initialized"}
+
+        streaming_candles = await db_manager.get_streaming_candles(symbol)
+        
+        return {
+            "streaming_data": streaming_candles,
+            "count": len(streaming_candles),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Ошибка получения потоковых данных: {e}")
         return {"error": str(e)}
 
 
