@@ -44,6 +44,12 @@ class BybitWebSocketClient:
         self.data_loading_complete = False
         self.initial_subscription_complete = False
 
+        # Настройки переподключения
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 10
+        self.reconnect_delay = 5  # секунд
+        self.connection_stable_time = 60  # секунд для считания соединения стабильным
+
     async def start(self):
         """Запуск WebSocket соединения с правильной очередностью"""
         self.is_running = True
@@ -277,27 +283,42 @@ class BybitWebSocketClient:
         logger.info("✅ WebSocket соединение установлено")
 
     async def _websocket_connection_loop(self):
-        """Основной цикл WebSocket соединения"""
+        """Основной цикл WebSocket соединения с улучшенной обработкой переподключений"""
         while self.is_running:
             try:
                 await self._connect_websocket()
+                # Если дошли сюда, соединение было успешным
+                self.reconnect_attempts = 0
+                
             except Exception as e:
                 logger.error(f"❌ WebSocket ошибка: {e}")
                 self.websocket_connected = False
+                
                 if self.is_running:
-                    logger.info("🔄 Переподключение через 5 секунд...")
-                    await asyncio.sleep(5)
+                    self.reconnect_attempts += 1
+                    
+                    if self.reconnect_attempts <= self.max_reconnect_attempts:
+                        delay = min(self.reconnect_delay * self.reconnect_attempts, 60)  # Максимум 60 секунд
+                        logger.info(f"🔄 Переподключение через {delay} секунд... (попытка {self.reconnect_attempts}/{self.max_reconnect_attempts})")
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(f"❌ Превышено максимальное количество попыток переподключения ({self.max_reconnect_attempts})")
+                        self.is_running = False
+                        break
 
     async def _connect_websocket(self):
-        """Подключение к WebSocket с подпиской на ВСЕ торговые пары"""
+        """Подключение к WebSocket с улучшенными настройками"""
         try:
             logger.info(f"🔌 Подключение к WebSocket: {self.ws_url}")
 
+            # Улучшенные настройки WebSocket
             async with websockets.connect(
                     self.ws_url,
-                    ping_interval=30,
-                    ping_timeout=10,
-                    close_timeout=10
+                    ping_interval=20,  # Уменьшаем интервал ping
+                    ping_timeout=10,   # Уменьшаем таймаут ping
+                    close_timeout=10,
+                    max_size=10**7,    # Увеличиваем максимальный размер сообщения
+                    compression=None   # Отключаем сжатие для стабильности
             ) as websocket:
                 self.websocket = websocket
                 self.websocket_connected = True
@@ -345,20 +366,33 @@ class BybitWebSocketClient:
                                 f"📊 WebSocket статистика: {self.messages_received} сообщений, подписано на {len(self.subscribed_pairs)} пар")
                             self.last_stats_log = datetime.utcnow()
 
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"⚠️ Некорректный JSON от WebSocket: {e}")
+                        continue
                     except Exception as e:
                         logger.error(f"❌ Ошибка обработки сообщения: {e}")
+                        continue
 
+        except websockets.exceptions.ConnectionClosedError as e:
+            logger.warning(f"⚠️ WebSocket соединение закрыто: {e}")
+            raise
+        except websockets.exceptions.InvalidStatusCode as e:
+            logger.error(f"❌ Неверный статус код WebSocket: {e}")
+            raise
         except Exception as e:
             logger.error(f"❌ Ошибка WebSocket соединения: {e}")
-            self.websocket_connected = False
             raise
         finally:
             self.websocket_connected = False
             if self.ping_task:
                 self.ping_task.cancel()
+                try:
+                    await self.ping_task
+                except asyncio.CancelledError:
+                    pass
 
     async def _subscribe_to_pairs(self, pairs: Set[str]):
-        """Подписка на торговые пары"""
+        """Подписка на торговые пары с обработкой ошибок"""
         if not pairs:
             return
 
@@ -373,15 +407,21 @@ class BybitWebSocketClient:
                 "args": [f"kline.1.{pair}" for pair in batch]
             }
 
-            await self.websocket.send(json.dumps(subscribe_message))
-            logger.info(f"📡 Подписка на пакет {i // batch_size + 1}: {len(batch)} пар")
+            try:
+                await self.websocket.send(json.dumps(subscribe_message))
+                logger.info(f"📡 Подписка на пакет {i // batch_size + 1}: {len(batch)} пар")
 
-            # Добавляем в ожидающие подписки
-            self.subscription_pending.update(batch)
+                # Добавляем в ожидающие подписки
+                self.subscription_pending.update(batch)
 
-            # Небольшая задержка между пакетами
-            if i + batch_size < len(pairs_list):
-                await asyncio.sleep(0.5)
+                # Небольшая задержка между пакетами
+                if i + batch_size < len(pairs_list):
+                    await asyncio.sleep(0.5)
+                    
+            except Exception as e:
+                logger.error(f"❌ Ошибка подписки на пакет {i // batch_size + 1}: {e}")
+                # Продолжаем с следующим пакетом
+                continue
 
     async def _start_periodic_tasks(self):
         """Запуск периодических задач"""
@@ -645,37 +685,71 @@ class BybitWebSocketClient:
 
     async def _monitor_connection(self):
         """Мониторинг состояния WebSocket соединения"""
-        while self.is_running:
+        connection_start_time = datetime.utcnow()
+        
+        while self.is_running and self.websocket_connected:
             try:
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)  # Проверяем каждые 30 секунд
 
+                if not self.websocket_connected:
+                    break
+
+                current_time = datetime.utcnow()
+                
+                # Проверяем время последнего сообщения
                 if self.last_message_time:
-                    time_since_last_message = (datetime.utcnow() - self.last_message_time).total_seconds()
+                    time_since_last_message = (current_time - self.last_message_time).total_seconds()
 
-                    if time_since_last_message > 120:
+                    if time_since_last_message > 90:  # 90 секунд без сообщений
                         logger.warning(f"⚠️ Нет сообщений от WebSocket уже {time_since_last_message:.0f} секунд")
 
                         await self.connection_manager.broadcast_json({
                             "type": "connection_status",
-                            "status": "disconnected",
-                            "reason": "No messages received",
-                            "timestamp": datetime.utcnow().isoformat()
+                            "status": "warning",
+                            "reason": f"No messages for {time_since_last_message:.0f} seconds",
+                            "timestamp": current_time.isoformat()
                         })
-                        break
+
+                        # Если нет сообщений более 2 минут, принудительно переподключаемся
+                        if time_since_last_message > 120:
+                            logger.error("❌ Принудительное переподключение из-за отсутствия сообщений")
+                            break
+
+                # Проверяем стабильность соединения
+                connection_duration = (current_time - connection_start_time).total_seconds()
+                if connection_duration > self.connection_stable_time:
+                    # Соединение стабильно, сбрасываем счетчик попыток
+                    self.reconnect_attempts = 0
 
             except Exception as e:
                 logger.error(f"❌ Ошибка мониторинга соединения: {e}")
+                break
 
     async def stop(self):
         """Остановка WebSocket соединения"""
         self.is_running = False
         self.websocket_connected = False
+        
         if self.ping_task:
             self.ping_task.cancel()
+            try:
+                await self.ping_task
+            except asyncio.CancelledError:
+                pass
+                
         if self.subscription_update_task:
             self.subscription_update_task.cancel()
+            try:
+                await self.subscription_update_task
+            except asyncio.CancelledError:
+                pass
+                
         if self.websocket:
-            await self.websocket.close()
+            try:
+                await self.websocket.close()
+            except Exception as e:
+                logger.debug(f"Ошибка при закрытии WebSocket: {e}")
+                
         logger.info("🛑 WebSocket клиент остановлен")
 
     def get_subscription_stats(self) -> Dict:
@@ -689,5 +763,7 @@ class BybitWebSocketClient:
                 self.trading_pairs) * 100 if self.trading_pairs else 0,
             'data_loading_complete': self.data_loading_complete,
             'initial_subscription_complete': self.initial_subscription_complete,
-            'websocket_connected': self.websocket_connected
+            'websocket_connected': self.websocket_connected,
+            'reconnect_attempts': self.reconnect_attempts,
+            'max_reconnect_attempts': self.max_reconnect_attempts
         }
