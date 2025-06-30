@@ -50,6 +50,14 @@ class BybitWebSocketClient:
         self.reconnect_delay = 5  # секунд
         self.connection_stable_time = 60  # секунд для считания соединения стабильным
 
+        # Кэш для предотвращения повторной загрузки данных
+        self.data_load_cache = {}  # symbol -> last_load_timestamp
+        self.data_load_cooldown = 300  # 5 минут между загрузками для одного символа
+        
+        # Отслеживание последней проверки целостности данных
+        self.last_integrity_check = {}  # symbol -> timestamp
+        self.integrity_check_interval = 1800  # 30 минут между проверками целостности
+
     async def start(self):
         """Запуск WebSocket соединения с правильной очередностью"""
         self.is_running = True
@@ -60,7 +68,7 @@ class BybitWebSocketClient:
             logger.info("📋 Шаг 1: Загрузка списка торговых пар...")
             await self._load_trading_pairs()
 
-            # Шаг 2: Загружаем исторические данные для всех пар
+            # Шаг 2: Загружаем исторические данные для всех пар (ТОЛЬКО ОДИН РАЗ)
             logger.info("📊 Шаг 2: Загрузка исторических данных...")
             await self._load_historical_data()
 
@@ -93,7 +101,7 @@ class BybitWebSocketClient:
             raise
 
     async def _load_historical_data(self):
-        """Загрузка исторических данных для всех пар"""
+        """Загрузка исторических данных для всех пар (ТОЛЬКО при первом запуске)"""
         if not self.trading_pairs:
             logger.info("📊 Нет торговых пар для загрузки данных")
             self.data_loading_complete = True
@@ -160,6 +168,12 @@ class BybitWebSocketClient:
             else:
                 logger.info("✅ Все данные актуальны, загрузка не требуется")
 
+            # Помечаем все пары как загруженные
+            current_time = datetime.utcnow()
+            for symbol in self.trading_pairs:
+                self.data_load_cache[symbol] = current_time
+                self.last_integrity_check[symbol] = current_time
+
             self.data_loading_complete = True
 
         except Exception as e:
@@ -167,8 +181,16 @@ class BybitWebSocketClient:
             raise
 
     async def _load_symbol_data(self, symbol: str, hours: int):
-        """Загрузка данных для одного символа"""
+        """Загрузка данных для одного символа с проверкой кэша"""
         try:
+            # Проверяем кэш загрузки
+            current_time = datetime.utcnow()
+            if symbol in self.data_load_cache:
+                last_load = self.data_load_cache[symbol]
+                if (current_time - last_load).total_seconds() < self.data_load_cooldown:
+                    logger.debug(f"📊 {symbol}: Пропуск загрузки (кэш актуален)")
+                    return
+
             # Определяем период для загрузки
             end_time_ms = int(datetime.utcnow().timestamp() * 1000)
             start_time_ms = end_time_ms - (hours * 60 * 60 * 1000)
@@ -177,6 +199,8 @@ class BybitWebSocketClient:
             success = await self._load_full_period(symbol, start_time_ms, end_time_ms)
             
             if success:
+                # Обновляем кэш загрузки
+                self.data_load_cache[symbol] = current_time
                 logger.debug(f"✅ Данные для {symbol} загружены успешно")
             else:
                 logger.warning(f"⚠️ Не удалось загрузить данные для {symbol}")
@@ -653,8 +677,8 @@ class BybitWebSocketClient:
                 # Помечаем свечу как обработанную
                 self.processed_candles[symbol] = start_time_ms
 
-                # Поддерживаем диапазон данных
-                await self._maintain_data_range(symbol)
+                # УБИРАЕМ автоматическое поддержание диапазона данных
+                # await self._maintain_data_range(symbol)
 
                 logger.debug(f"📊 Обработана закрытая свеча {symbol} в {start_time_ms}")
 
@@ -662,8 +686,15 @@ class BybitWebSocketClient:
             logger.error(f"❌ Ошибка обработки закрытой свечи для {symbol}: {e}")
 
     async def _maintain_data_range(self, symbol: str):
-        """Поддержание диапазона данных в заданных пределах"""
+        """Поддержание диапазона данных в заданных пределах (ТОЛЬКО при необходимости)"""
         try:
+            # Проверяем, нужна ли проверка целостности для этого символа
+            current_time = datetime.utcnow()
+            if symbol in self.last_integrity_check:
+                last_check = self.last_integrity_check[symbol]
+                if (current_time - last_check).total_seconds() < self.integrity_check_interval:
+                    return  # Проверка не нужна
+
             # Получаем настройки диапазона
             retention_hours = self.alert_manager.settings.get('data_retention_hours', 2)
             analysis_hours = self.alert_manager.settings.get('analysis_hours', 1)
@@ -672,13 +703,16 @@ class BybitWebSocketClient:
             # Очищаем старые данные
             await self.alert_manager.db_manager.cleanup_old_candles(symbol, total_hours_needed)
 
-            # Проверяем, нужно ли загрузить новые данные
+            # Проверяем, нужно ли загрузить новые данные (ТОЛЬКО если критически мало)
             integrity_info = await self.alert_manager.db_manager.check_data_integrity(symbol, total_hours_needed)
 
-            # Если целостность низкая, загружаем недостающие данные
-            if integrity_info['integrity_percentage'] < 90 and integrity_info['missing_count'] > 5:
-                logger.debug(f"📊 Загрузка недостающих данных для {symbol}: {integrity_info['missing_count']} свечей")
+            # Загружаем данные ТОЛЬКО если целостность очень низкая
+            if integrity_info['integrity_percentage'] < 50 and integrity_info['missing_count'] > 30:
+                logger.info(f"📊 Критическая нехватка данных для {symbol}: {integrity_info['missing_count']} свечей, загружаем...")
                 await self._load_symbol_data(symbol, total_hours_needed)
+
+            # Обновляем время последней проверки
+            self.last_integrity_check[symbol] = current_time
 
         except Exception as e:
             logger.error(f"❌ Ошибка поддержания диапазона данных для {symbol}: {e}")
