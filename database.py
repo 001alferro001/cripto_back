@@ -254,11 +254,11 @@ class DatabaseManager:
 
     async def get_watchlist_details(self) -> List[Dict]:
         """Получить детальную информацию о торговых парах"""
-        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+        cursor = self.connection.cursor()
         try:
             logger.debug("🔍 Получение деталей watchlist...")
             
-            # Сначала проверяем существование таблицы
+            # Сначала проверяем существование таблицы (используем обычный cursor)
             cursor.execute("""
                 SELECT EXISTS (
                     SELECT FROM information_schema.tables 
@@ -266,7 +266,9 @@ class DatabaseManager:
                 )
             """)
             
-            table_exists = cursor.fetchone()[0]
+            result = cursor.fetchone()
+            table_exists = result[0] if result else False
+            
             if not table_exists:
                 logger.warning("⚠️ Таблица watchlist не существует")
                 return []
@@ -304,6 +306,10 @@ class DatabaseManager:
             query_columns = ", ".join(available_columns)
             logger.debug(f"🔍 Запрос с колонками: {query_columns}")
             
+            # Закрываем обычный cursor и открываем RealDictCursor для основного запроса
+            cursor.close()
+            cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+            
             cursor.execute(f"""
                 SELECT {query_columns}
                 FROM watchlist 
@@ -324,7 +330,8 @@ class DatabaseManager:
             logger.error(f"❌ Полная трассировка: {traceback.format_exc()}")
             return []
         finally:
-            cursor.close()
+            if cursor:
+                cursor.close()
 
     async def add_to_watchlist(self, symbol: str, price_drop: float = None, 
                               current_price: float = None, historical_price: float = None):
@@ -527,7 +534,8 @@ class DatabaseManager:
                 AND is_closed = TRUE
             """, (symbol, start_time_ms, end_time_ms))
             
-            actual_count = cursor.fetchone()[0]
+            result = cursor.fetchone()
+            actual_count = result[0] if result else 0
             
             # Рассчитываем процент целостности
             integrity_percentage = (actual_count / expected_count * 100) if expected_count > 0 else 0
@@ -565,7 +573,8 @@ class DatabaseManager:
                 AND is_closed = TRUE
             """, (symbol, start_time_ms, end_time_ms))
             
-            actual_count = cursor.fetchone()[0]
+            result = cursor.fetchone()
+            actual_count = result[0] if result else 0
             
             # Рассчитываем процент целостности
             integrity_percentage = (actual_count / expected_count * 100) if expected_count > 0 else 0
@@ -739,7 +748,8 @@ class DatabaseManager:
                 alert_data.get('message')
             ))
             
-            alert_id = cursor.fetchone()[0]
+            result = cursor.fetchone()
+            alert_id = result[0] if result else None
             return alert_id
             
         except Exception as e:
@@ -1029,7 +1039,8 @@ class DatabaseManager:
                 trade_data.get('alert_id')
             ))
             
-            return cursor.fetchone()[0]
+            result = cursor.fetchone()
+            return result[0] if result else None
             
         except Exception as e:
             logger.error(f"❌ Ошибка создания бумажной сделки: {type(e).__name__}: {str(e)}")
