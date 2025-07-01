@@ -50,9 +50,8 @@ class BybitWebSocketClient:
         self.reconnect_delay = 5  # секунд
         self.connection_stable_time = 60  # секунд для считания соединения стабильным
 
-        # Кэш для предотвращения повторной загрузки данных
-        self.data_load_cache = {}  # symbol -> last_load_timestamp
-        self.data_load_cooldown = 300  # 5 минут между загрузками для одного символа
+        # Улучшенные настройки кэширования
+        self.data_load_cooldown = 1800  # 30 минут между загрузками для одного символа
         
         # Отслеживание последней проверки целостности данных
         self.last_integrity_check = {}  # symbol -> timestamp
@@ -61,6 +60,10 @@ class BybitWebSocketClient:
         # Управление диапазоном данных
         self.data_range_manager_task = None
         self.data_range_check_interval = 300  # 5 минут между проверками диапазона
+
+        # Настройки для предотвращения повторной загрузки
+        self.min_integrity_for_skip = 90  # Минимальная целостность для пропуска загрузки
+        self.min_candles_for_skip = 50   # Минимальное количество свечей для пропуска загрузки
 
     async def start(self):
         """Запуск WebSocket соединения с правильной очередностью"""
@@ -72,9 +75,9 @@ class BybitWebSocketClient:
             logger.info("📋 Шаг 1: Загрузка списка торговых пар...")
             await self._load_trading_pairs()
 
-            # Шаг 2: Загружаем исторические данные для всех пар (ТОЛЬКО ОДИН РАЗ)
-            logger.info("📊 Шаг 2: Загрузка исторических данных...")
-            await self._load_historical_data()
+            # Шаг 2: Проверяем и загружаем исторические данные (только если нужно)
+            logger.info("📊 Шаг 2: Проверка и загрузка исторических данных...")
+            await self._check_and_load_historical_data()
 
             # Шаг 3: Подключаемся к WebSocket и подписываемся на все пары
             logger.info("🔌 Шаг 3: Подключение к WebSocket и подписка на пары...")
@@ -104,8 +107,8 @@ class BybitWebSocketClient:
             logger.error(f"❌ Ошибка загрузки торговых пар: {e}")
             raise
 
-    async def _load_historical_data(self):
-        """Загрузка исторических данных для всех пар"""
+    async def _check_and_load_historical_data(self):
+        """Умная проверка и загрузка исторических данных"""
         if not self.trading_pairs:
             logger.info("📊 Нет торговых пар для загрузки данных")
             self.data_loading_complete = True
@@ -117,82 +120,125 @@ class BybitWebSocketClient:
             analysis_hours = self.alert_manager.settings.get('analysis_hours', 1)
             total_hours_needed = retention_hours + analysis_hours + 1  # +1 час буфера
 
-            logger.info(f"📊 Начинаем загрузку данных для {len(self.trading_pairs)} пар (период: {total_hours_needed}ч)")
+            logger.info(f"📊 Проверка данных для {len(self.trading_pairs)} пар (требуется: {total_hours_needed}ч)")
 
-            # Проверяем какие пары нуждаются в загрузке данных
-            pairs_to_load = []
-            pairs_with_data = []
+            # Анализируем состояние данных для всех пар
+            pairs_analysis = await self._analyze_pairs_data_status(total_hours_needed)
+            
+            pairs_to_load = pairs_analysis['needs_loading']
+            pairs_with_data = pairs_analysis['has_data']
+            pairs_partial = pairs_analysis['partial_data']
 
-            for symbol in self.trading_pairs:
-                try:
-                    integrity_info = await self.alert_manager.db_manager.check_data_integrity(
-                        symbol, total_hours_needed
-                    )
+            logger.info(f"📊 Анализ данных:")
+            logger.info(f"  ✅ Пары с полными данными: {len(pairs_with_data)}")
+            logger.info(f"  🔄 Пары с частичными данными: {len(pairs_partial)}")
+            logger.info(f"  📥 Пары требующие загрузки: {len(pairs_to_load)}")
 
-                    # Если данных мало или целостность низкая - добавляем в список для загрузки
-                    if integrity_info['integrity_percentage'] < 80 or integrity_info['total_existing'] < 60:
-                        pairs_to_load.append(symbol)
-                        logger.debug(
-                            f"📊 {symbol}: Требуется загрузка ({integrity_info['total_existing']}/{integrity_info['total_expected']} свечей)")
-                    else:
-                        pairs_with_data.append(symbol)
-                        logger.debug(f"✅ {symbol}: Данные актуальны ({integrity_info['integrity_percentage']:.1f}%)")
-
-                except Exception as e:
-                    logger.error(f"❌ Ошибка проверки данных для {symbol}: {e}")
-                    pairs_to_load.append(symbol)
-
-            logger.info(
-                f"📊 Найдено {len(pairs_with_data)} пар с актуальными данными, {len(pairs_to_load)} требуют загрузки")
-
-            # Загружаем данные для пар, которым это нужно
+            # Загружаем данные только для пар, которым это действительно нужно
             if pairs_to_load:
                 logger.info(f"📊 Загрузка данных для {len(pairs_to_load)} пар...")
-
-                # Загружаем данные пакетами для избежания перегрузки API
-                batch_size = 10
-                for i in range(0, len(pairs_to_load), batch_size):
-                    batch = pairs_to_load[i:i + batch_size]
-                    logger.info(f"📊 Загрузка пакета {i // batch_size + 1}: {len(batch)} пар")
-
-                    # Загружаем пары в пакете параллельно
-                    tasks = [self._load_symbol_data(symbol, total_hours_needed) for symbol in batch]
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    
-                    # Проверяем результаты
-                    for j, result in enumerate(results):
-                        if isinstance(result, Exception):
-                            logger.error(f"❌ Ошибка загрузки данных для {batch[j]}: {result}")
-
-                    # Небольшая пауза между пакетами
-                    if i + batch_size < len(pairs_to_load):
-                        await asyncio.sleep(1)
-
-                logger.info("✅ Загрузка исторических данных завершена")
+                await self._load_data_for_pairs(pairs_to_load, total_hours_needed)
             else:
-                logger.info("✅ Все данные актуальны, загрузка не требуется")
+                logger.info("✅ Все пары имеют достаточно данных, загрузка не требуется")
 
-            # Помечаем все пары как загруженные
-            current_time = datetime.utcnow()
-            for symbol in self.trading_pairs:
-                self.data_load_cache[symbol] = current_time
-                self.last_integrity_check[symbol] = current_time
+            # Для пар с частичными данными - дозагружаем недостающее
+            if pairs_partial:
+                logger.info(f"📊 Дозагрузка данных для {len(pairs_partial)} пар с частичными данными...")
+                await self._load_data_for_pairs(pairs_partial, total_hours_needed, is_partial=True)
 
             self.data_loading_complete = True
+            logger.info("✅ Проверка и загрузка исторических данных завершена")
 
         except Exception as e:
-            logger.error(f"❌ Ошибка загрузки исторических данных: {e}")
+            logger.error(f"❌ Ошибка проверки и загрузки исторических данных: {e}")
             raise
 
-    async def _load_symbol_data(self, symbol: str, hours: int):
-        """Загрузка данных для одного символа с проверкой кэша"""
+    async def _analyze_pairs_data_status(self, hours_needed: int) -> Dict:
+        """Анализ состояния данных для всех пар"""
+        pairs_with_data = []
+        pairs_partial_data = []
+        pairs_need_loading = []
+
+        for symbol in self.trading_pairs:
+            try:
+                # Проверяем целостность данных
+                integrity_info = await self.alert_manager.db_manager.check_data_integrity(
+                    symbol, hours_needed
+                )
+
+                total_existing = integrity_info.get('total_existing', 0)
+                integrity_percentage = integrity_info.get('integrity_percentage', 0)
+                expected_count = integrity_info.get('total_expected', hours_needed * 60)
+
+                logger.debug(f"📊 {symbol}: {total_existing}/{expected_count} свечей ({integrity_percentage:.1f}%)")
+
+                # Классифицируем пары по состоянию данных
+                if (integrity_percentage >= self.min_integrity_for_skip and 
+                    total_existing >= self.min_candles_for_skip):
+                    pairs_with_data.append(symbol)
+                    logger.debug(f"✅ {symbol}: Данные достаточны")
+                    
+                elif total_existing >= 20 and integrity_percentage >= 60:
+                    pairs_partial_data.append(symbol)
+                    logger.debug(f"🔄 {symbol}: Частичные данные")
+                    
+                else:
+                    pairs_need_loading.append(symbol)
+                    logger.debug(f"📥 {symbol}: Требуется загрузка")
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка анализа данных для {symbol}: {e}")
+                pairs_need_loading.append(symbol)
+
+        return {
+            'has_data': pairs_with_data,
+            'partial_data': pairs_partial_data,
+            'needs_loading': pairs_need_loading
+        }
+
+    async def _load_data_for_pairs(self, pairs: List[str], hours: int, is_partial: bool = False):
+        """Загрузка данных для списка пар"""
+        if not pairs:
+            return
+
+        action = "Дозагрузка" if is_partial else "Загрузка"
+        logger.info(f"📊 {action} данных для {len(pairs)} пар...")
+
+        # Загружаем данные пакетами для избежания перегрузки API
+        batch_size = 8 if is_partial else 10
+        
+        for i in range(0, len(pairs), batch_size):
+            batch = pairs[i:i + batch_size]
+            logger.info(f"📊 {action} пакета {i // batch_size + 1}: {len(batch)} пар")
+
+            # Загружаем пары в пакете параллельно
+            tasks = [self._load_symbol_data(symbol, hours, force_load=not is_partial) for symbol in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Проверяем результаты
+            for j, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"❌ Ошибка загрузки данных для {batch[j]}: {result}")
+
+            # Небольшая пауза между пакетами
+            if i + batch_size < len(pairs):
+                await asyncio.sleep(0.5 if is_partial else 1)
+
+        logger.info(f"✅ {action} данных завершена")
+
+    async def _load_symbol_data(self, symbol: str, hours: int, force_load: bool = False):
+        """Загрузка данных для одного символа с улучшенной проверкой кэша"""
         try:
-            # Проверяем кэш загрузки
             current_time = datetime.utcnow()
-            if symbol in self.data_load_cache:
-                last_load = self.data_load_cache[symbol]
-                if (current_time - last_load).total_seconds() < self.data_load_cooldown:
-                    logger.debug(f"📊 {symbol}: Пропуск загрузки (кэш актуален)")
+
+            # Если не принудительная загрузка, проверяем нужна ли загрузка
+            if not force_load:
+                # Проверяем актуальность данных
+                integrity_info = await self.alert_manager.db_manager.check_data_integrity(symbol, hours)
+                
+                if (integrity_info.get('integrity_percentage', 0) >= self.min_integrity_for_skip and
+                    integrity_info.get('total_existing', 0) >= self.min_candles_for_skip):
+                    logger.debug(f"📊 {symbol}: Пропуск загрузки - данные актуальны")
                     return
 
             # Определяем период для загрузки с запасом
@@ -205,8 +251,6 @@ class BybitWebSocketClient:
             success = await self._load_full_period(symbol, start_time_ms, end_time_ms)
             
             if success:
-                # Обновляем кэш загрузки
-                self.data_load_cache[symbol] = current_time
                 logger.debug(f"✅ Данные для {symbol} загружены успешно")
                 
                 # Сразу после загрузки поддерживаем правильный диапазон
@@ -327,7 +371,9 @@ class BybitWebSocketClient:
                 # Небольшая задержка между запросами
                 await asyncio.sleep(0.2)
 
-            logger.info(f"📊 {symbol}: Загружено {total_loaded} новых свечей, пропущено {total_skipped} существующих")
+            if total_loaded > 0 or total_skipped > 0:
+                logger.info(f"📊 {symbol}: Загружено {total_loaded} новых свечей, пропущено {total_skipped} существующих")
+            
             return True
 
         except Exception as e:
@@ -573,25 +619,7 @@ class BybitWebSocketClient:
             logger.info(f"📊 Загрузка данных для {len(new_pairs)} новых пар (период: {total_hours_needed}ч)...")
 
             # Загружаем данные пакетами
-            batch_size = 5
-            new_pairs_list = list(new_pairs)
-            
-            for i in range(0, len(new_pairs_list), batch_size):
-                batch = new_pairs_list[i:i + batch_size]
-                logger.info(f"📊 Загрузка пакета новых пар {i // batch_size + 1}: {len(batch)} пар")
-
-                # Загружаем пары в пакете параллельно
-                tasks = [self._load_symbol_data(symbol, total_hours_needed) for symbol in batch]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                
-                # Проверяем результаты
-                for j, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        logger.error(f"❌ Ошибка загрузки данных для новой пары {batch[j]}: {result}")
-
-                # Небольшая пауза между пакетами
-                if i + batch_size < len(new_pairs_list):
-                    await asyncio.sleep(1)
+            await self._load_data_for_pairs(list(new_pairs), total_hours_needed)
 
             logger.info("✅ Загрузка данных для новых пар завершена")
 
@@ -700,7 +728,7 @@ class BybitWebSocketClient:
             logger.debug(f"📊 {symbol}: Текущее количество свечей: {current_count}/{expected_candles}, пропущено: {missing_count}")
 
             # 4. Загружаем недостающие данные, если их много
-            if missing_count > 5:  # Загружаем только если пропущено больше 5 свечей
+            if missing_count > 10:  # Загружаем только если пропущено больше 10 свечей
                 logger.info(f"📊 {symbol}: Загрузка {missing_count} недостающих свечей...")
                 
                 # Загружаем недостающие данные
@@ -834,9 +862,6 @@ class BybitWebSocketClient:
 
                 # Помечаем свечу как обработанную
                 self.processed_candles[symbol] = start_time_ms
-
-                # Поддерживаем точный диапазон данных после каждой новой свечи
-                await self._maintain_exact_data_range(symbol)
 
                 logger.debug(f"📊 Обработана закрытая свеча {symbol} в {start_time_ms}")
 
