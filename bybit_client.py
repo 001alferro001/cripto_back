@@ -101,7 +101,7 @@ class BybitWebSocketClient:
             raise
 
     async def _load_historical_data(self):
-        """Загрузка исторических данных для всех пар (ТОЛЬКО при первом запуске)"""
+        """Загрузка исторических данных для всех пар"""
         if not self.trading_pairs:
             logger.info("📊 Нет торговых пар для загрузки данных")
             self.data_loading_complete = True
@@ -513,13 +513,26 @@ class BybitWebSocketClient:
 
             logger.info(f"📊 Загрузка данных для {len(new_pairs)} новых пар...")
 
-            for symbol in new_pairs:
-                try:
-                    await self._load_symbol_data(symbol, total_hours_needed)
-                    await asyncio.sleep(0.1)  # Небольшая задержка между запросами
-                except Exception as e:
-                    logger.error(f"❌ Ошибка загрузки данных для новой пары {symbol}: {e}")
-                    continue
+            # Загружаем данные пакетами
+            batch_size = 5
+            new_pairs_list = list(new_pairs)
+            
+            for i in range(0, len(new_pairs_list), batch_size):
+                batch = new_pairs_list[i:i + batch_size]
+                logger.info(f"📊 Загрузка пакета новых пар {i // batch_size + 1}: {len(batch)} пар")
+
+                # Загружаем пары в пакете параллельно
+                tasks = [self._load_symbol_data(symbol, total_hours_needed) for symbol in batch]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Проверяем результаты
+                for j, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        logger.error(f"❌ Ошибка загрузки данных для новой пары {batch[j]}: {result}")
+
+                # Небольшая пауза между пакетами
+                if i + batch_size < len(new_pairs_list):
+                    await asyncio.sleep(1)
 
             logger.info("✅ Загрузка данных для новых пар завершена")
 
