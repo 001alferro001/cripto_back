@@ -28,10 +28,58 @@ class DatabaseManager:
             self.connection = psycopg2.connect(**self.db_config)
             self.connection.autocommit = True
             await self.create_tables()
+            await self.migrate_database()  # Добавляем миграции
             logger.info("✅ База данных инициализирована")
         except Exception as e:
             logger.error(f"❌ Ошибка инициализации базы данных: {e}")
             raise
+
+    async def migrate_database(self):
+        """Выполнение миграций базы данных"""
+        cursor = self.connection.cursor()
+        try:
+            # Проверяем и добавляем недостающие колонки в watchlist
+            cursor.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'watchlist' AND column_name = 'added_at'
+            """)
+            
+            if not cursor.fetchone():
+                logger.info("🔄 Добавление колонки added_at в таблицу watchlist")
+                cursor.execute("""
+                    ALTER TABLE watchlist 
+                    ADD COLUMN added_at TIMESTAMPTZ DEFAULT NOW()
+                """)
+
+            # Проверяем и добавляем updated_at если её нет
+            cursor.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'watchlist' AND column_name = 'updated_at'
+            """)
+            
+            if not cursor.fetchone():
+                logger.info("🔄 Добавление колонки updated_at в таблицу watchlist")
+                cursor.execute("""
+                    ALTER TABLE watchlist 
+                    ADD COLUMN updated_at TIMESTAMPTZ DEFAULT NOW()
+                """)
+
+            # Обновляем существующие записи, у которых нет времени
+            cursor.execute("""
+                UPDATE watchlist 
+                SET added_at = NOW(), updated_at = NOW() 
+                WHERE added_at IS NULL OR updated_at IS NULL
+            """)
+
+            logger.info("✅ Миграции базы данных выполнены")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка выполнения миграций: {e}")
+            raise
+        finally:
+            cursor.close()
 
     async def create_tables(self):
         """Создание необходимых таблиц"""
@@ -205,9 +253,24 @@ class DatabaseManager:
         """Получить детальную информацию о торговых парах"""
         cursor = self.connection.cursor(cursor_factory=RealDictCursor)
         try:
+            # Проверяем существование колонок перед запросом
             cursor.execute("""
-                SELECT id, symbol, is_active, price_drop_percentage, 
-                       current_price, historical_price, added_at, updated_at
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'watchlist'
+            """)
+            columns = [row[0] for row in cursor.fetchall()]
+            
+            # Формируем запрос только с существующими колонками
+            base_columns = "id, symbol, is_active, price_drop_percentage, current_price, historical_price"
+            
+            if 'added_at' in columns:
+                base_columns += ", added_at"
+            if 'updated_at' in columns:
+                base_columns += ", updated_at"
+            
+            cursor.execute(f"""
+                SELECT {base_columns}
                 FROM watchlist 
                 ORDER BY symbol
             """)
