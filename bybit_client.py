@@ -191,9 +191,11 @@ class BybitWebSocketClient:
                     logger.debug(f"📊 {symbol}: Пропуск загрузки (кэш актуален)")
                     return
 
-            # Определяем период для загрузки
+            # Определяем период для загрузки с запасом
             end_time_ms = int(datetime.utcnow().timestamp() * 1000)
             start_time_ms = end_time_ms - (hours * 60 * 60 * 1000)
+
+            logger.info(f"📊 {symbol}: Загрузка данных за {hours} часов ({(end_time_ms - start_time_ms) // 60000} минут)")
 
             # Загружаем данные с биржи
             success = await self._load_full_period(symbol, start_time_ms, end_time_ms)
@@ -210,77 +212,116 @@ class BybitWebSocketClient:
             raise
 
     async def _load_full_period(self, symbol: str, start_time_ms: int, end_time_ms: int) -> bool:
-        """Загрузка полного периода данных"""
+        """Загрузка полного периода данных с пагинацией"""
         try:
-            hours = (end_time_ms - start_time_ms) / (60 * 60 * 1000)
-            limit = min(int(hours * 60) + 60, 1000)
-
-            url = f"{self.rest_url}/v5/market/kline"
-            params = {
-                'category': 'linear',
-                'symbol': symbol,
-                'interval': '1',
-                'start': start_time_ms,
-                'end': end_time_ms,
-                'limit': limit
-            }
-
-            response = requests.get(url, params=params, timeout=10)
+            total_loaded = 0
+            total_skipped = 0
+            current_start = start_time_ms
             
-            if response.status_code != 200:
-                logger.error(f"❌ HTTP ошибка {response.status_code} для {symbol}")
-                return False
+            # Максимальный лимит API Bybit для kline - 1000 свечей
+            max_limit = 1000
+            
+            while current_start < end_time_ms:
+                # Рассчитываем лимит для текущего запроса
+                remaining_minutes = (end_time_ms - current_start) // 60000
+                limit = min(remaining_minutes + 10, max_limit)  # +10 для запаса
                 
-            data = response.json()
+                if limit <= 0:
+                    break
 
-            if data.get('retCode') == 0:
-                klines = data['result']['list']
-                if not klines:
-                    logger.warning(f"⚠️ Нет данных для {symbol}")
+                url = f"{self.rest_url}/v5/market/kline"
+                params = {
+                    'category': 'linear',
+                    'symbol': symbol,
+                    'interval': '1',
+                    'start': current_start,
+                    'end': end_time_ms,
+                    'limit': limit
+                }
+
+                logger.debug(f"📊 {symbol}: Запрос {limit} свечей с {datetime.utcfromtimestamp(current_start/1000)}")
+
+                response = requests.get(url, params=params, timeout=15)
+                
+                if response.status_code != 200:
+                    logger.error(f"❌ HTTP ошибка {response.status_code} для {symbol}")
                     return False
                     
-                klines.reverse()  # Bybit возвращает данные в обратном порядке
+                data = response.json()
 
-                saved_count = 0
-                skipped_count = 0
+                if data.get('retCode') == 0:
+                    klines = data['result']['list']
+                    if not klines:
+                        logger.debug(f"📊 {symbol}: Нет данных в текущем диапазоне")
+                        break
+                        
+                    # Bybit возвращает данные в обратном порядке (новые -> старые)
+                    klines.reverse()
 
-                for kline in klines:
-                    try:
-                        # Биржа передает время в миллисекундах
-                        kline_timestamp_ms = int(kline[0])
+                    batch_loaded = 0
+                    batch_skipped = 0
+                    last_timestamp = current_start
 
-                        # Для исторических данных округляем до минут
-                        rounded_timestamp = (kline_timestamp_ms // 60000) * 60000
-
-                        kline_data = {
-                            'start': rounded_timestamp,
-                            'end': rounded_timestamp + 60000,
-                            'open': float(kline[1]),
-                            'high': float(kline[2]),
-                            'low': float(kline[3]),
-                            'close': float(kline[4]),
-                            'volume': float(kline[5]),
-                            'confirm': True  # Исторические данные всегда закрыты
-                        }
-
-                        # Проверяем, есть ли уже эта свеча в базе
-                        existing = await self.alert_manager.db_manager.check_candle_exists(symbol, rounded_timestamp)
-                        if not existing:
-                            # Сохраняем как исторические данные
-                            await self.alert_manager.db_manager.save_historical_kline_data(symbol, kline_data)
-                            saved_count += 1
-                        else:
-                            skipped_count += 1
+                    for kline in klines:
+                        try:
+                            # Биржа передает время в миллисекундах
+                            kline_timestamp_ms = int(kline[0])
                             
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка обработки свечи для {symbol}: {e}")
-                        continue
+                            # Пропускаем свечи вне нашего диапазона
+                            if kline_timestamp_ms < start_time_ms or kline_timestamp_ms >= end_time_ms:
+                                continue
 
-                logger.info(f"📊 {symbol}: Загружено {saved_count} новых свечей, пропущено {skipped_count} существующих")
-                return True
-            else:
-                logger.error(f"❌ Ошибка API при загрузке данных для {symbol}: {data.get('retMsg')}")
-                return False
+                            # Для исторических данных округляем до минут
+                            rounded_timestamp = (kline_timestamp_ms // 60000) * 60000
+
+                            kline_data = {
+                                'start': rounded_timestamp,
+                                'end': rounded_timestamp + 60000,
+                                'open': float(kline[1]),
+                                'high': float(kline[2]),
+                                'low': float(kline[3]),
+                                'close': float(kline[4]),
+                                'volume': float(kline[5]),
+                                'confirm': True  # Исторические данные всегда закрыты
+                            }
+
+                            # Проверяем, есть ли уже эта свеча в базе
+                            existing = await self.alert_manager.db_manager.check_candle_exists(symbol, rounded_timestamp)
+                            if not existing:
+                                # Сохраняем как исторические данные
+                                await self.alert_manager.db_manager.save_historical_kline_data(symbol, kline_data)
+                                batch_loaded += 1
+                            else:
+                                batch_skipped += 1
+                            
+                            last_timestamp = max(last_timestamp, kline_timestamp_ms)
+                                
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка обработки свечи для {symbol}: {e}")
+                            continue
+
+                    total_loaded += batch_loaded
+                    total_skipped += batch_skipped
+                    
+                    logger.debug(f"📊 {symbol}: Пакет - загружено {batch_loaded}, пропущено {batch_skipped}")
+
+                    # Обновляем начальную точку для следующего запроса
+                    # Добавляем 1 минуту к последней обработанной свече
+                    current_start = last_timestamp + 60000
+                    
+                    # Если получили меньше данных чем запрашивали, значит достигли конца
+                    if len(klines) < limit:
+                        break
+                        
+                else:
+                    logger.error(f"❌ Ошибка API при загрузке данных для {symbol}: {data.get('retMsg')}")
+                    return False
+
+                # Небольшая задержка между запросами
+                await asyncio.sleep(0.2)
+
+            logger.info(f"📊 {symbol}: Загружено {total_loaded} новых свечей, пропущено {total_skipped} существующих")
+            return True
 
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки полного периода для {symbol}: {e}")
@@ -519,7 +560,7 @@ class BybitWebSocketClient:
             analysis_hours = self.alert_manager.settings.get('analysis_hours', 1)
             total_hours_needed = retention_hours + analysis_hours + 1
 
-            logger.info(f"📊 Загрузка данных для {len(new_pairs)} новых пар...")
+            logger.info(f"📊 Загрузка данных для {len(new_pairs)} новых пар (период: {total_hours_needed}ч)...")
 
             # Загружаем данные пакетами
             batch_size = 5
