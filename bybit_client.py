@@ -58,6 +58,10 @@ class BybitWebSocketClient:
         self.last_integrity_check = {}  # symbol -> timestamp
         self.integrity_check_interval = 1800  # 30 минут между проверками целостности
 
+        # Управление диапазоном данных
+        self.data_range_manager_task = None
+        self.data_range_check_interval = 300  # 5 минут между проверками диапазона
+
     async def start(self):
         """Запуск WebSocket соединения с правильной очередностью"""
         self.is_running = True
@@ -204,6 +208,9 @@ class BybitWebSocketClient:
                 # Обновляем кэш загрузки
                 self.data_load_cache[symbol] = current_time
                 logger.debug(f"✅ Данные для {symbol} загружены успешно")
+                
+                # Сразу после загрузки поддерживаем правильный диапазон
+                await self._maintain_exact_data_range(symbol)
             else:
                 logger.warning(f"⚠️ Не удалось загрузить данные для {symbol}")
 
@@ -493,6 +500,9 @@ class BybitWebSocketClient:
         # Задача обновления подписок
         self.subscription_update_task = asyncio.create_task(self._subscription_updater())
 
+        # Задача управления диапазоном данных
+        self.data_range_manager_task = asyncio.create_task(self._data_range_manager())
+
         # Задача очистки данных
         asyncio.create_task(self._data_cleanup_task())
 
@@ -620,6 +630,92 @@ class BybitWebSocketClient:
         except Exception as e:
             logger.error(f"❌ Ошибка обновления подписок WebSocket: {e}")
 
+    async def _data_range_manager(self):
+        """Менеджер диапазона данных - поддерживает точное количество свечей"""
+        logger.info(f"📊 Запуск менеджера диапазона данных (проверка каждые {self.data_range_check_interval} сек)")
+        
+        while self.is_running:
+            try:
+                await asyncio.sleep(self.data_range_check_interval)
+
+                if not self.is_running:
+                    break
+
+                logger.debug("📊 Проверка диапазона данных для всех пар...")
+
+                # Проверяем диапазон данных для каждого символа
+                for symbol in list(self.trading_pairs):
+                    try:
+                        await self._maintain_exact_data_range(symbol)
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка поддержания диапазона данных для {symbol}: {e}")
+
+                logger.debug("✅ Проверка диапазона данных завершена")
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка менеджера диапазона данных: {e}")
+                await asyncio.sleep(60)  # При ошибке ждем 1 минуту
+
+    async def _maintain_exact_data_range(self, symbol: str):
+        """Поддержание точного диапазона данных согласно настройкам"""
+        try:
+            # Получаем настройки
+            retention_hours = self.alert_manager.settings.get('data_retention_hours', 2)
+            analysis_hours = self.alert_manager.settings.get('analysis_hours', 1)
+            
+            # Общий диапазон = retention + analysis (без буфера для точного количества)
+            total_hours = retention_hours + analysis_hours
+            expected_candles = total_hours * 60  # Количество минутных свечей
+            
+            # Определяем временные границы
+            current_time_ms = int(datetime.utcnow().timestamp() * 1000)
+            # Округляем до начала минуты
+            current_minute_ms = (current_time_ms // 60000) * 60000
+            
+            # Начало диапазона - ровно N часов назад от текущей минуты
+            start_time_ms = current_minute_ms - (total_hours * 60 * 60 * 1000)
+            end_time_ms = current_minute_ms  # До текущей минуты (не включая)
+
+            logger.debug(f"📊 {symbol}: Поддержание диапазона {total_hours}ч ({expected_candles} свечей)")
+            logger.debug(f"📊 {symbol}: Диапазон {datetime.utcfromtimestamp(start_time_ms/1000)} - {datetime.utcfromtimestamp(end_time_ms/1000)}")
+
+            # 1. Удаляем старые данные (до start_time_ms)
+            deleted_count = await self.alert_manager.db_manager.cleanup_old_candles_before_time(symbol, start_time_ms)
+            if deleted_count > 0:
+                logger.debug(f"📊 {symbol}: Удалено {deleted_count} старых свечей")
+
+            # 2. Удаляем будущие данные (после end_time_ms)
+            future_deleted = await self.alert_manager.db_manager.cleanup_future_candles_after_time(symbol, end_time_ms)
+            if future_deleted > 0:
+                logger.debug(f"📊 {symbol}: Удалено {future_deleted} будущих свечей")
+
+            # 3. Проверяем целостность данных в диапазоне
+            integrity_info = await self.alert_manager.db_manager.check_data_integrity_range(
+                symbol, start_time_ms, end_time_ms
+            )
+
+            current_count = integrity_info.get('total_existing', 0)
+            missing_count = integrity_info.get('missing_count', 0)
+            
+            logger.debug(f"📊 {symbol}: Текущее количество свечей: {current_count}/{expected_candles}, пропущено: {missing_count}")
+
+            # 4. Загружаем недостающие данные, если их много
+            if missing_count > 5:  # Загружаем только если пропущено больше 5 свечей
+                logger.info(f"📊 {symbol}: Загрузка {missing_count} недостающих свечей...")
+                
+                # Загружаем недостающие данные
+                success = await self._load_full_period(symbol, start_time_ms, end_time_ms)
+                if success:
+                    # Повторно проверяем количество после загрузки
+                    new_integrity = await self.alert_manager.db_manager.check_data_integrity_range(
+                        symbol, start_time_ms, end_time_ms
+                    )
+                    new_count = new_integrity.get('total_existing', 0)
+                    logger.info(f"📊 {symbol}: После загрузки: {new_count}/{expected_candles} свечей")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка поддержания точного диапазона данных для {symbol}: {e}")
+
     async def _data_cleanup_task(self):
         """Задача очистки старых данных"""
         while self.is_running:
@@ -739,45 +835,13 @@ class BybitWebSocketClient:
                 # Помечаем свечу как обработанную
                 self.processed_candles[symbol] = start_time_ms
 
-                # УБИРАЕМ автоматическое поддержание диапазона данных
-                # await self._maintain_data_range(symbol)
+                # Поддерживаем точный диапазон данных после каждой новой свечи
+                await self._maintain_exact_data_range(symbol)
 
                 logger.debug(f"📊 Обработана закрытая свеча {symbol} в {start_time_ms}")
 
         except Exception as e:
             logger.error(f"❌ Ошибка обработки закрытой свечи для {symbol}: {e}")
-
-    async def _maintain_data_range(self, symbol: str):
-        """Поддержание диапазона данных в заданных пределах (ТОЛЬКО при необходимости)"""
-        try:
-            # Проверяем, нужна ли проверка целостности для этого символа
-            current_time = datetime.utcnow()
-            if symbol in self.last_integrity_check:
-                last_check = self.last_integrity_check[symbol]
-                if (current_time - last_check).total_seconds() < self.integrity_check_interval:
-                    return  # Проверка не нужна
-
-            # Получаем настройки диапазона
-            retention_hours = self.alert_manager.settings.get('data_retention_hours', 2)
-            analysis_hours = self.alert_manager.settings.get('analysis_hours', 1)
-            total_hours_needed = retention_hours + analysis_hours + 1
-
-            # Очищаем старые данные
-            await self.alert_manager.db_manager.cleanup_old_candles(symbol, total_hours_needed)
-
-            # Проверяем, нужно ли загрузить новые данные (ТОЛЬКО если критически мало)
-            integrity_info = await self.alert_manager.db_manager.check_data_integrity(symbol, total_hours_needed)
-
-            # Загружаем данные ТОЛЬКО если целостность очень низкая
-            if integrity_info['integrity_percentage'] < 50 and integrity_info['missing_count'] > 30:
-                logger.info(f"📊 Критическая нехватка данных для {symbol}: {integrity_info['missing_count']} свечей, загружаем...")
-                await self._load_symbol_data(symbol, total_hours_needed)
-
-            # Обновляем время последней проверки
-            self.last_integrity_check[symbol] = current_time
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка поддержания диапазона данных для {symbol}: {e}")
 
     async def _monitor_connection(self):
         """Мониторинг состояния WebSocket соединения"""
@@ -837,6 +901,13 @@ class BybitWebSocketClient:
             self.subscription_update_task.cancel()
             try:
                 await self.subscription_update_task
+            except asyncio.CancelledError:
+                pass
+
+        if self.data_range_manager_task:
+            self.data_range_manager_task.cancel()
+            try:
+                await self.data_range_manager_task
             except asyncio.CancelledError:
                 pass
                 
