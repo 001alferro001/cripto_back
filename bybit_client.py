@@ -51,8 +51,9 @@ class BybitWebSocketClient:
         self.reconnect_delay = 5  # секунд
         self.connection_stable_time = 60  # секунд для считания соединения стабильным
 
-        # Улучшенные настройки кэширования
-        self.data_load_cooldown = 1800  # 30 минут между загрузками для одного символа
+        # Улучшенные настройки кэширования и проверки данных
+        self.data_load_cooldown = 3600  # 1 час между загрузками для одного символа
+        self.last_data_load_time = {}  # symbol -> timestamp последней загрузки
         
         # Отслеживание последней проверки целостности данных
         self.last_integrity_check = {}  # symbol -> timestamp
@@ -63,23 +64,19 @@ class BybitWebSocketClient:
         self.data_range_check_interval = 300  # 5 минут между проверками диапазона
 
         # Настройки для предотвращения повторной загрузки
-        self.min_integrity_for_skip = 90  # Минимальная целостность для пропуска загрузки
-        self.min_candles_for_skip = 50   # Минимальное количество свечей для пропуска загрузки
+        self.min_integrity_for_skip = 85  # Минимальная целостность для пропуска загрузки (повышено с 90)
+        self.min_candles_for_skip = 30   # Минимальное количество свечей для пропуска загрузки (снижено с 50)
+        self.max_data_age_hours = 6      # Максимальный возраст данных в часах
 
         # Мониторинг потоковых данных
         self.last_stream_data = {}  # symbol -> timestamp последних данных
-        self.stream_timeout_seconds = 120  # Таймаут для потоковых данных
+        self.stream_timeout_seconds = 300  # Таймаут для потоковых данных (5 минут)
         self.stream_monitor_task = None
-        
-        # Новые настройки для решения проблем с потоковыми данными
-        self.inactive_pairs_threshold = 0.3  # 30% неактивных пар для переподключения
-        self.force_reconnect_timeout = 300  # 5 минут без данных для принудительного переподключения
-        self.subscription_retry_task = None
+
+        # Статистика по парам для диагностики
+        self.pair_statistics = {}  # symbol -> stats
         self.failed_subscriptions = set()  # Пары с неудачными подписками
-        self.subscription_retry_interval = 60  # Повторная попытка подписки каждую минуту
-        
-        # Детальная статистика по парам
-        self.pair_statistics = {}  # symbol -> {'messages': count, 'last_message': timestamp, 'errors': count}
+        self.subscription_retry_manager_task = None
 
     async def start(self):
         """Запуск WebSocket соединения с правильной очередностью"""
@@ -91,9 +88,9 @@ class BybitWebSocketClient:
             logger.info("📋 Шаг 1: Загрузка списка торговых пар...")
             await self._load_trading_pairs()
 
-            # Шаг 2: Проверяем и загружаем исторические данные (только если нужно)
-            logger.info("📊 Шаг 2: Проверка и загрузка исторических данных...")
-            await self._check_and_load_historical_data()
+            # Шаг 2: Умная проверка и загрузка исторических данных
+            logger.info("📊 Шаг 2: Умная проверка и загрузка исторических данных...")
+            await self._smart_check_and_load_historical_data()
 
             # Шаг 3: Подключаемся к WebSocket и подписываемся на все пары
             logger.info("🔌 Шаг 3: Подключение к WebSocket и подписка на пары...")
@@ -123,21 +120,12 @@ class BybitWebSocketClient:
             if len(self.trading_pairs) == 0:
                 logger.warning("⚠️ Список торговых пар пуст. Система будет ожидать добавления пар.")
 
-            # Инициализируем статистику для всех пар
-            for symbol in self.trading_pairs:
-                self.pair_statistics[symbol] = {
-                    'messages': 0,
-                    'last_message': None,
-                    'errors': 0,
-                    'subscription_attempts': 0
-                }
-
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки торговых пар: {e}")
             raise
 
-    async def _check_and_load_historical_data(self):
-        """Умная проверка и загрузка исторических данных"""
+    async def _smart_check_and_load_historical_data(self):
+        """Умная проверка и загрузка исторических данных с предотвращением повторной загрузки"""
         if not self.trading_pairs:
             logger.info("📊 Нет торговых пар для загрузки данных")
             self.data_loading_complete = True
@@ -149,55 +137,80 @@ class BybitWebSocketClient:
             analysis_hours = self.alert_manager.settings.get('analysis_hours', 1)
             total_hours_needed = retention_hours + analysis_hours + 1  # +1 час буфера
 
-            logger.info(f"📊 Проверка данных для {len(self.trading_pairs)} пар (требуется: {total_hours_needed}ч)")
+            logger.info(f"📊 Умная проверка данных для {len(self.trading_pairs)} пар (требуется: {total_hours_needed}ч)")
 
-            # Анализируем состояние данных для всех пар
-            pairs_analysis = await self._analyze_pairs_data_status(total_hours_needed)
+            # Анализируем состояние данных для всех пар с улучшенной логикой
+            pairs_analysis = await self._smart_analyze_pairs_data_status(total_hours_needed)
             
             pairs_to_load = pairs_analysis['needs_loading']
             pairs_with_data = pairs_analysis['has_data']
             pairs_partial = pairs_analysis['partial_data']
+            pairs_outdated = pairs_analysis['outdated_data']
 
-            logger.info(f"📊 Анализ данных:")
-            logger.info(f"  ✅ Пары с полными данными: {len(pairs_with_data)}")
+            logger.info(f"📊 Умный анализ данных:")
+            logger.info(f"  ✅ Пары с актуальными данными: {len(pairs_with_data)}")
             logger.info(f"  🔄 Пары с частичными данными: {len(pairs_partial)}")
-            logger.info(f"  📥 Пары требующие загрузки: {len(pairs_to_load)}")
+            logger.info(f"  ⏰ Пары с устаревшими данными: {len(pairs_outdated)}")
+            logger.info(f"  📥 Пары требующие полной загрузки: {len(pairs_to_load)}")
 
             # Загружаем данные только для пар, которым это действительно нужно
             if pairs_to_load:
-                logger.info(f"📊 Загрузка данных для {len(pairs_to_load)} пар...")
-                await self._load_data_for_pairs(pairs_to_load, total_hours_needed)
-            else:
-                logger.info("✅ Все пары имеют достаточно данных, загрузка не требуется")
-
+                logger.info(f"📊 Полная загрузка данных для {len(pairs_to_load)} пар...")
+                await self._load_data_for_pairs(pairs_to_load, total_hours_needed, load_type="full")
+            
             # Для пар с частичными данными - дозагружаем недостающее
             if pairs_partial:
                 logger.info(f"📊 Дозагрузка данных для {len(pairs_partial)} пар с частичными данными...")
-                await self._load_data_for_pairs(pairs_partial, total_hours_needed, is_partial=True)
+                await self._load_data_for_pairs(pairs_partial, total_hours_needed, load_type="partial")
+            
+            # Для устаревших данных - обновляем только недавние свечи
+            if pairs_outdated:
+                logger.info(f"📊 Обновление данных для {len(pairs_outdated)} пар с устаревшими данными...")
+                await self._update_recent_data_for_pairs(pairs_outdated)
+
+            # Если все пары имеют достаточно данных
+            if not pairs_to_load and not pairs_partial and not pairs_outdated:
+                logger.info("✅ Все пары имеют актуальные и достаточные данные, загрузка не требуется")
 
             self.data_loading_complete = True
-            logger.info("✅ Проверка и загрузка исторических данных завершена")
+            logger.info("✅ Умная проверка и загрузка исторических данных завершена")
 
             # Уведомляем о готовности к потоковым данным
             await self.connection_manager.broadcast_json({
                 "type": "historical_data_loaded",
                 "pairs_count": len(self.trading_pairs),
+                "pairs_with_data": len(pairs_with_data),
+                "pairs_loaded": len(pairs_to_load),
+                "pairs_updated": len(pairs_partial) + len(pairs_outdated),
                 "ready_for_streaming": True,
                 "timestamp": datetime.utcnow().isoformat()
             })
 
         except Exception as e:
-            logger.error(f"❌ Ошибка проверки и загрузки исторических данных: {e}")
+            logger.error(f"❌ Ошибка умной проверки и загрузки исторических данных: {e}")
             raise
 
-    async def _analyze_pairs_data_status(self, hours_needed: int) -> Dict:
-        """Анализ состояния данных для всех пар"""
+    async def _smart_analyze_pairs_data_status(self, hours_needed: int) -> Dict:
+        """Умный анализ состояния данных для всех пар с учетом времени последней загрузки"""
         pairs_with_data = []
         pairs_partial_data = []
         pairs_need_loading = []
+        pairs_outdated_data = []
+
+        current_time = datetime.utcnow()
+        current_time_ms = int(current_time.timestamp() * 1000)
 
         for symbol in self.trading_pairs:
             try:
+                # Проверяем, когда последний раз загружали данные для этого символа
+                last_load_time = self.last_data_load_time.get(symbol)
+                if last_load_time:
+                    time_since_load = (current_time_ms - last_load_time) / 1000  # в секундах
+                    if time_since_load < self.data_load_cooldown:
+                        logger.debug(f"📊 {symbol}: Пропуск проверки - данные загружались {time_since_load/60:.1f} мин назад")
+                        pairs_with_data.append(symbol)
+                        continue
+
                 # Проверяем целостность данных
                 integrity_info = await self.alert_manager.db_manager.check_data_integrity(
                     symbol, hours_needed
@@ -207,21 +220,35 @@ class BybitWebSocketClient:
                 integrity_percentage = integrity_info.get('integrity_percentage', 0)
                 expected_count = integrity_info.get('total_expected', hours_needed * 60)
 
-                logger.debug(f"📊 {symbol}: {total_existing}/{expected_count} свечей ({integrity_percentage:.1f}%)")
+                # Проверяем возраст данных
+                latest_candle_time = await self._get_latest_candle_time(symbol)
+                data_age_hours = 0
+                if latest_candle_time:
+                    data_age_hours = (current_time_ms - latest_candle_time) / (1000 * 60 * 60)
 
-                # Классифицируем пары по состоянию данных
+                logger.debug(f"📊 {symbol}: {total_existing}/{expected_count} свечей ({integrity_percentage:.1f}%), возраст: {data_age_hours:.1f}ч")
+
+                # Классифицируем пары по состоянию данных с улучшенной логикой
                 if (integrity_percentage >= self.min_integrity_for_skip and 
-                    total_existing >= self.min_candles_for_skip):
+                    total_existing >= self.min_candles_for_skip and
+                    data_age_hours <= self.max_data_age_hours):
                     pairs_with_data.append(symbol)
-                    logger.debug(f"✅ {symbol}: Данные достаточны")
+                    logger.debug(f"✅ {symbol}: Данные актуальны и достаточны")
                     
-                elif total_existing >= 20 and integrity_percentage >= 60:
+                elif (total_existing >= 20 and 
+                      integrity_percentage >= 60 and 
+                      data_age_hours <= self.max_data_age_hours):
                     pairs_partial_data.append(symbol)
-                    logger.debug(f"🔄 {symbol}: Частичные данные")
+                    logger.debug(f"🔄 {symbol}: Частичные данные, требуется дозагрузка")
+                    
+                elif (total_existing >= self.min_candles_for_skip and 
+                      data_age_hours > self.max_data_age_hours):
+                    pairs_outdated_data.append(symbol)
+                    logger.debug(f"⏰ {symbol}: Данные устарели, требуется обновление")
                     
                 else:
                     pairs_need_loading.append(symbol)
-                    logger.debug(f"📥 {symbol}: Требуется загрузка")
+                    logger.debug(f"📥 {symbol}: Требуется полная загрузка")
 
             except Exception as e:
                 logger.error(f"❌ Ошибка анализа данных для {symbol}: {e}")
@@ -230,26 +257,107 @@ class BybitWebSocketClient:
         return {
             'has_data': pairs_with_data,
             'partial_data': pairs_partial_data,
-            'needs_loading': pairs_need_loading
+            'needs_loading': pairs_need_loading,
+            'outdated_data': pairs_outdated_data
         }
 
-    async def _load_data_for_pairs(self, pairs: List[str], hours: int, is_partial: bool = False):
-        """Загрузка данных для списка пар"""
+    async def _get_latest_candle_time(self, symbol: str) -> Optional[int]:
+        """Получить время последней свечи для символа"""
+        try:
+            cursor = self.alert_manager.db_manager.connection.cursor()
+            cursor.execute("""
+                SELECT MAX(timestamp_ms) FROM kline_data 
+                WHERE symbol = %s AND is_closed = TRUE
+            """, (symbol,))
+            
+            result = cursor.fetchone()
+            cursor.close()
+            
+            return result[0] if result and result[0] else None
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения времени последней свечи для {symbol}: {e}")
+            return None
+
+    async def _update_recent_data_for_pairs(self, pairs: List[str]):
+        """Обновление только недавних данных для пар с устаревшими данными"""
         if not pairs:
             return
 
-        action = "Дозагрузка" if is_partial else "Загрузка"
+        logger.info(f"📊 Обновление недавних данных для {len(pairs)} пар...")
+
+        # Обновляем данные пакетами
+        batch_size = 10
+        
+        for i in range(0, len(pairs), batch_size):
+            batch = pairs[i:i + batch_size]
+            logger.info(f"📊 Обновление пакета {i // batch_size + 1}: {len(batch)} пар")
+
+            # Обновляем пары в пакете параллельно
+            tasks = [self._update_recent_symbol_data(symbol) for symbol in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Проверяем результаты
+            for j, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"❌ Ошибка обновления данных для {batch[j]}: {result}")
+
+            # Небольшая пауза между пакетами
+            if i + batch_size < len(pairs):
+                await asyncio.sleep(0.5)
+
+        logger.info(f"✅ Обновление недавних данных завершено")
+
+    async def _update_recent_symbol_data(self, symbol: str):
+        """Обновление недавних данных для одного символа"""
+        try:
+            # Получаем время последней свечи
+            latest_candle_time = await self._get_latest_candle_time(symbol)
+            
+            if not latest_candle_time:
+                logger.warning(f"⚠️ {symbol}: Не найдено время последней свечи, пропускаем обновление")
+                return
+
+            # Загружаем данные только с последней свечи до текущего времени
+            current_time_ms = int(datetime.utcnow().timestamp() * 1000)
+            start_time_ms = latest_candle_time
+            
+            # Добавляем небольшой буфер (1 час назад от последней свечи)
+            start_time_ms = max(start_time_ms - (60 * 60 * 1000), 
+                               current_time_ms - (6 * 60 * 60 * 1000))  # Максимум 6 часов
+
+            logger.debug(f"📊 {symbol}: Обновление данных с {datetime.utcfromtimestamp(start_time_ms/1000)} до текущего времени")
+
+            # Загружаем недавние данные
+            success = await self._load_full_period(symbol, start_time_ms, current_time_ms)
+            
+            if success:
+                # Обновляем время последней загрузки
+                self.last_data_load_time[symbol] = current_time_ms
+                logger.debug(f"✅ Недавние данные для {symbol} обновлены успешно")
+            else:
+                logger.warning(f"⚠️ Не удалось обновить недавние данные для {symbol}")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления недавних данных для {symbol}: {e}")
+
+    async def _load_data_for_pairs(self, pairs: List[str], hours: int, load_type: str = "full"):
+        """Загрузка данных для списка пар с указанием типа загрузки"""
+        if not pairs:
+            return
+
+        action = f"{load_type.capitalize()} загрузка"
         logger.info(f"📊 {action} данных для {len(pairs)} пар...")
 
         # Загружаем данные пакетами для избежания перегрузки API
-        batch_size = 8 if is_partial else 10
+        batch_size = 8 if load_type == "partial" else 10
         
         for i in range(0, len(pairs), batch_size):
             batch = pairs[i:i + batch_size]
             logger.info(f"📊 {action} пакета {i // batch_size + 1}: {len(batch)} пар")
 
             # Загружаем пары в пакете параллельно
-            tasks = [self._load_symbol_data(symbol, hours, force_load=not is_partial) for symbol in batch]
+            tasks = [self._load_symbol_data(symbol, hours, force_load=(load_type == "full")) for symbol in batch]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
             # Проверяем результаты
@@ -259,7 +367,7 @@ class BybitWebSocketClient:
 
             # Небольшая пауза между пакетами
             if i + batch_size < len(pairs):
-                await asyncio.sleep(0.5 if is_partial else 1)
+                await asyncio.sleep(0.5 if load_type == "partial" else 1)
 
         logger.info(f"✅ {action} данных завершена")
 
@@ -267,19 +375,36 @@ class BybitWebSocketClient:
         """Загрузка данных для одного символа с улучшенной проверкой кэша"""
         try:
             current_time = datetime.utcnow()
+            current_time_ms = int(current_time.timestamp() * 1000)
 
             # Если не принудительная загрузка, проверяем нужна ли загрузка
             if not force_load:
+                # Проверяем время последней загрузки
+                last_load_time = self.last_data_load_time.get(symbol)
+                if last_load_time:
+                    time_since_load = (current_time_ms - last_load_time) / 1000  # в секундах
+                    if time_since_load < self.data_load_cooldown:
+                        logger.debug(f"📊 {symbol}: Пропуск загрузки - данные загружались {time_since_load/60:.1f} мин назад")
+                        return
+
                 # Проверяем актуальность данных
                 integrity_info = await self.alert_manager.db_manager.check_data_integrity(symbol, hours)
                 
                 if (integrity_info.get('integrity_percentage', 0) >= self.min_integrity_for_skip and
                     integrity_info.get('total_existing', 0) >= self.min_candles_for_skip):
-                    logger.debug(f"📊 {symbol}: Пропуск загрузки - данные актуальны")
-                    return
+                    
+                    # Дополнительно проверяем возраст данных
+                    latest_candle_time = await self._get_latest_candle_time(symbol)
+                    if latest_candle_time:
+                        data_age_hours = (current_time_ms - latest_candle_time) / (1000 * 60 * 60)
+                        if data_age_hours <= self.max_data_age_hours:
+                            logger.debug(f"📊 {symbol}: Пропуск загрузки - данные актуальны (возраст: {data_age_hours:.1f}ч)")
+                            # Обновляем время последней "загрузки" чтобы не проверять снова
+                            self.last_data_load_time[symbol] = current_time_ms
+                            return
 
             # Определяем период для загрузки с запасом
-            end_time_ms = int(datetime.utcnow().timestamp() * 1000)
+            end_time_ms = current_time_ms
             start_time_ms = end_time_ms - (hours * 60 * 60 * 1000)
 
             logger.info(f"📊 {symbol}: Загрузка данных за {hours} часов ({(end_time_ms - start_time_ms) // 60000} минут)")
@@ -288,6 +413,8 @@ class BybitWebSocketClient:
             success = await self._load_full_period(symbol, start_time_ms, end_time_ms)
             
             if success:
+                # Обновляем время последней загрузки
+                self.last_data_load_time[symbol] = current_time_ms
                 logger.debug(f"✅ Данные для {symbol} загружены успешно")
                 
                 # Сразу после загрузки поддерживаем правильный диапазон
@@ -450,8 +577,6 @@ class BybitWebSocketClient:
             self.initial_subscription_complete = True
         else:
             logger.warning(f"⚠️ Подписка частично завершена: {len(self.subscribed_pairs)}/{len(self.trading_pairs)} пар")
-            # Добавляем неподписанные пары в список неудачных
-            self.failed_subscriptions = self.trading_pairs - self.subscribed_pairs
 
     async def _websocket_connection_loop(self):
         """Основной цикл WebSocket соединения с улучшенной обработкой переподключений"""
@@ -591,11 +716,18 @@ class BybitWebSocketClient:
 
                 # Добавляем в ожидающие подписки
                 self.subscription_pending.update(batch)
-                
-                # Обновляем статистику попыток подписки
-                for symbol in batch:
-                    if symbol in self.pair_statistics:
-                        self.pair_statistics[symbol]['subscription_attempts'] += 1
+
+                # Инициализируем статистику для пар
+                for pair in batch:
+                    if pair not in self.pair_statistics:
+                        self.pair_statistics[pair] = {
+                            'messages_count': 0,
+                            'last_message_time': None,
+                            'subscription_attempts': 0,
+                            'subscription_errors': 0,
+                            'is_subscribed': False
+                        }
+                    self.pair_statistics[pair]['subscription_attempts'] += 1
 
                 # Небольшая задержка между пакетами
                 if i + batch_size < len(pairs_list):
@@ -605,6 +737,10 @@ class BybitWebSocketClient:
                 logger.error(f"❌ Ошибка подписки на пакет {i // batch_size + 1}: {e}")
                 # Добавляем пары в список неудачных подписок
                 self.failed_subscriptions.update(batch)
+                # Обновляем статистику ошибок
+                for pair in batch:
+                    if pair in self.pair_statistics:
+                        self.pair_statistics[pair]['subscription_errors'] += 1
                 continue
 
     async def _start_periodic_tasks(self):
@@ -617,9 +753,32 @@ class BybitWebSocketClient:
 
         # Задача очистки данных
         asyncio.create_task(self._data_cleanup_task())
-        
+
         # Задача повторных попыток подписки
-        self.subscription_retry_task = asyncio.create_task(self._subscription_retry_manager())
+        self.subscription_retry_manager_task = asyncio.create_task(self._subscription_retry_manager())
+
+    async def _subscription_retry_manager(self):
+        """Менеджер повторных попыток подписки на неудачные пары"""
+        while self.is_running:
+            try:
+                await asyncio.sleep(60)  # Проверяем каждую минуту
+
+                if not self.is_running or not self.websocket_connected:
+                    continue
+
+                # Проверяем неудачные подписки
+                if self.failed_subscriptions:
+                    logger.info(f"🔄 Повторная попытка подписки на {len(self.failed_subscriptions)} неудачных пар")
+                    
+                    # Пытаемся переподписаться на неудачные пары
+                    failed_pairs = self.failed_subscriptions.copy()
+                    self.failed_subscriptions.clear()
+                    
+                    await self._subscribe_to_pairs(failed_pairs)
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка менеджера повторных подписок: {e}")
+                await asyncio.sleep(60)
 
     async def _start_stream_monitoring(self):
         """Запуск мониторинга потоковых данных"""
@@ -627,7 +786,7 @@ class BybitWebSocketClient:
         logger.info("📡 Мониторинг потоковых данных запущен")
 
     async def _stream_monitor(self):
-        """Улучшенный мониторинг активности потоковых данных"""
+        """Мониторинг активности потоковых данных с улучшенной диагностикой"""
         while self.is_running:
             try:
                 await asyncio.sleep(30)  # Проверяем каждые 30 секунд
@@ -637,7 +796,7 @@ class BybitWebSocketClient:
 
                 current_time = datetime.utcnow()
                 inactive_pairs = []
-                critical_pairs = []  # Пары без данных более 5 минут
+                critical_pairs = []
 
                 # Проверяем активность потоковых данных для каждой пары
                 for symbol in self.trading_pairs:
@@ -646,16 +805,20 @@ class BybitWebSocketClient:
                     if last_data_time:
                         time_since_last = (current_time - last_data_time).total_seconds()
                         
-                        if time_since_last > self.force_reconnect_timeout:  # 5 минут
-                            critical_pairs.append(symbol)
-                            logger.error(f"🚨 КРИТИЧНО: Нет потоковых данных для {symbol} уже {time_since_last:.0f} секунд")
-                        elif time_since_last > self.stream_timeout_seconds:  # 2 минуты
+                        if time_since_last > self.stream_timeout_seconds:
                             inactive_pairs.append(symbol)
-                            logger.warning(f"⚠️ Нет потоковых данных для {symbol} уже {time_since_last:.0f} секунд")
+                            
+                            # Критичные пары (без данных более 5 минут)
+                            if time_since_last > 300:
+                                critical_pairs.append(symbol)
+                                logger.error(f"🚨 КРИТИЧНО: Нет потоковых данных для {symbol} уже {time_since_last:.0f} секунд")
+                            else:
+                                logger.warning(f"⚠️ Нет потоковых данных для {symbol} уже {time_since_last:.0f} секунд")
                     else:
-                        # Пара никогда не получала данные
+                        # Пара вообще не получала данных
+                        inactive_pairs.append(symbol)
                         critical_pairs.append(symbol)
-                        logger.error(f"🚨 КРИТИЧНО: Пара {symbol} никогда не получала потоковые данные")
+                        logger.error(f"🚨 КРИТИЧНО: {symbol} не получал потоковых данных с момента запуска")
 
                 # Отправляем детальную статистику потоковых данных
                 streaming_stats = {
@@ -667,69 +830,35 @@ class BybitWebSocketClient:
                     "websocket_connected": self.websocket_connected,
                     "streaming_active": self.streaming_active,
                     "messages_received": self.messages_received,
-                    "subscribed_pairs": len(self.subscribed_pairs),
                     "failed_subscriptions": len(self.failed_subscriptions),
-                    "inactive_pair_list": inactive_pairs[:10],  # Первые 10 неактивных пар
-                    "critical_pair_list": critical_pairs[:10],  # Первые 10 критичных пар
+                    "pair_details": {
+                        symbol: {
+                            'last_message': self.last_stream_data.get(symbol).isoformat() if self.last_stream_data.get(symbol) else None,
+                            'messages_count': self.pair_statistics.get(symbol, {}).get('messages_count', 0),
+                            'is_subscribed': symbol in self.subscribed_pairs,
+                            'subscription_attempts': self.pair_statistics.get(symbol, {}).get('subscription_attempts', 0),
+                            'subscription_errors': self.pair_statistics.get(symbol, {}).get('subscription_errors', 0)
+                        } for symbol in self.trading_pairs
+                    },
                     "timestamp": current_time.isoformat()
                 }
 
                 await self.connection_manager.broadcast_json(streaming_stats)
 
-                # Принимаем решение о переподключении
-                inactive_ratio = len(inactive_pairs) / len(self.trading_pairs) if self.trading_pairs else 0
+                # Если слишком много критичных пар или неактивных пар, пытаемся переподключиться
+                critical_threshold = max(1, len(self.trading_pairs) * 0.3)  # 30% пар
                 
-                # Если есть критичные пары или слишком много неактивных - переподключаемся
-                if critical_pairs or inactive_ratio > self.inactive_pairs_threshold:
-                    logger.error(f"❌ Критическая ситуация с потоковыми данными:")
-                    logger.error(f"   - Критичных пар: {len(critical_pairs)}")
-                    logger.error(f"   - Неактивных пар: {len(inactive_pairs)}/{len(self.trading_pairs)} ({inactive_ratio:.1%})")
-                    logger.error(f"   - Инициируем переподключение...")
-                    
-                    # Принудительно закрываем WebSocket для переподключения
+                if len(critical_pairs) >= critical_threshold:
+                    logger.error(f"❌ Слишком много критичных пар ({len(critical_pairs)}/{len(self.trading_pairs)}). Принудительное переподключение...")
                     if self.websocket:
-                        try:
-                            await self.websocket.close()
-                        except:
-                            pass
+                        await self.websocket.close()
+                elif len(inactive_pairs) > len(self.trading_pairs) * 0.5:  # 50% пар неактивны
+                    logger.error(f"❌ Слишком много неактивных пар ({len(inactive_pairs)}/{len(self.trading_pairs)}). Переподключение...")
+                    if self.websocket:
+                        await self.websocket.close()
 
             except Exception as e:
                 logger.error(f"❌ Ошибка мониторинга потоковых данных: {e}")
-                await asyncio.sleep(60)
-
-    async def _subscription_retry_manager(self):
-        """Менеджер повторных попыток подписки для неудачных пар"""
-        while self.is_running:
-            try:
-                await asyncio.sleep(self.subscription_retry_interval)
-
-                if not self.is_running or not self.websocket_connected:
-                    continue
-
-                # Проверяем пары, которые не получают данные
-                current_time = datetime.utcnow()
-                pairs_to_retry = set()
-
-                # Добавляем пары из failed_subscriptions
-                pairs_to_retry.update(self.failed_subscriptions)
-
-                # Добавляем пары, которые давно не получали данные
-                for symbol in self.trading_pairs:
-                    last_data_time = self.last_stream_data.get(symbol)
-                    if not last_data_time or (current_time - last_data_time).total_seconds() > self.force_reconnect_timeout:
-                        pairs_to_retry.add(symbol)
-
-                if pairs_to_retry:
-                    logger.info(f"🔄 Повторная попытка подписки для {len(pairs_to_retry)} пар: {list(pairs_to_retry)[:5]}...")
-                    
-                    # Пытаемся переподписаться
-                    await self._subscribe_to_pairs(pairs_to_retry)
-                    
-                    # Очищаем список неудачных подписок (они будут добавлены обратно, если снова не сработают)
-                    self.failed_subscriptions.clear()
-
-            except Exception as e:
-                logger.error(f"❌ Ошибка менеджера повторных подписок: {e}")
                 await asyncio.sleep(60)
 
     async def _subscription_updater(self):
@@ -776,19 +905,6 @@ class BybitWebSocketClient:
                 self.trading_pairs.update(new_pairs)
                 self.trading_pairs -= removed_pairs
 
-                # Инициализируем статистику для новых пар
-                for symbol in new_pairs:
-                    self.pair_statistics[symbol] = {
-                        'messages': 0,
-                        'last_message': None,
-                        'errors': 0,
-                        'subscription_attempts': 0
-                    }
-
-                # Удаляем статистику для удаленных пар
-                for symbol in removed_pairs:
-                    self.pair_statistics.pop(symbol, None)
-
                 # Загружаем данные для новых пар
                 if new_pairs:
                     await self._load_data_for_new_pairs(new_pairs)
@@ -812,7 +928,7 @@ class BybitWebSocketClient:
             logger.info(f"📊 Загрузка данных для {len(new_pairs)} новых пар (период: {total_hours_needed}ч)...")
 
             # Загружаем данные пакетами
-            await self._load_data_for_pairs(list(new_pairs), total_hours_needed)
+            await self._load_data_for_pairs(list(new_pairs), total_hours_needed, load_type="full")
 
             logger.info("✅ Загрузка данных для новых пар завершена")
 
@@ -837,6 +953,7 @@ class BybitWebSocketClient:
                 # Удаляем из мониторинга потоковых данных
                 for pair in removed_pairs:
                     self.last_stream_data.pop(pair, None)
+                    self.pair_statistics.pop(pair, None)
 
             # Подписываемся на новые пары
             if new_pairs:
@@ -969,7 +1086,7 @@ class BybitWebSocketClient:
                 logger.error(f"❌ Ошибка задачи очистки данных: {e}")
 
     async def _handle_message(self, data: Dict):
-        """Обработка входящих WebSocket сообщений с улучшенной диагностикой"""
+        """Обработка входящих WebSocket сообщений"""
         try:
             # Обрабатываем системные сообщения
             if 'success' in data:
@@ -995,21 +1112,20 @@ class BybitWebSocketClient:
                     logger.debug(f"📊 Получены данные для символа {symbol}, которого нет в watchlist")
                     return
 
-                # Обновляем статистику для пары
-                if symbol in self.pair_statistics:
-                    self.pair_statistics[symbol]['messages'] += 1
-                    self.pair_statistics[symbol]['last_message'] = datetime.utcnow()
-
                 # Добавляем символ в подписанные (если получили данные, значит подписка работает)
                 if symbol in self.subscription_pending:
                     self.subscription_pending.remove(symbol)
-                    logger.debug(f"✅ Подтверждена подписка для {symbol}")
-                
                 if symbol in self.failed_subscriptions:
                     self.failed_subscriptions.remove(symbol)
-                    logger.info(f"✅ Восстановлена подписка для {symbol}")
+                    logger.info(f"✅ Восстановлена подписка на {symbol}")
                 
                 self.subscribed_pairs.add(symbol)
+
+                # Обновляем статистику пары
+                if symbol in self.pair_statistics:
+                    self.pair_statistics[symbol]['messages_count'] += 1
+                    self.pair_statistics[symbol]['last_message_time'] = datetime.utcnow()
+                    self.pair_statistics[symbol]['is_subscribed'] = True
 
                 # Обновляем время последних потоковых данных
                 self.last_stream_data[symbol] = datetime.utcnow()
@@ -1061,9 +1177,6 @@ class BybitWebSocketClient:
 
         except Exception as e:
             logger.error(f"❌ Ошибка обработки kline данных: {e}")
-            # Обновляем статистику ошибок для пары
-            if 'symbol' in locals() and symbol in self.pair_statistics:
-                self.pair_statistics[symbol]['errors'] += 1
 
     async def _process_closed_candle(self, symbol: str, formatted_data: Dict):
         """Обработка закрытой свечи"""
@@ -1112,8 +1225,8 @@ class BybitWebSocketClient:
                             "timestamp": current_time.isoformat()
                         })
 
-                        # Если нет сообщений более 2 минут, принудительно переподключаемся
-                        if time_since_last_message > 120:
+                        # Если нет сообщений более 5 минут, принудительно переподключаемся
+                        if time_since_last_message > 300:  # Снижено с 120 до 300 секунд
                             logger.error("❌ Принудительное переподключение из-за отсутствия сообщений")
                             self.streaming_active = False
                             break
@@ -1134,22 +1247,40 @@ class BybitWebSocketClient:
         self.websocket_connected = False
         self.streaming_active = False
         
-        # Останавливаем все задачи
-        tasks_to_cancel = [
-            self.ping_task,
-            self.subscription_update_task,
-            self.data_range_manager_task,
-            self.stream_monitor_task,
-            self.subscription_retry_task
-        ]
-        
-        for task in tasks_to_cancel:
-            if task:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+        if self.ping_task:
+            self.ping_task.cancel()
+            try:
+                await self.ping_task
+            except asyncio.CancelledError:
+                pass
+                
+        if self.subscription_update_task:
+            self.subscription_update_task.cancel()
+            try:
+                await self.subscription_update_task
+            except asyncio.CancelledError:
+                pass
+
+        if self.data_range_manager_task:
+            self.data_range_manager_task.cancel()
+            try:
+                await self.data_range_manager_task
+            except asyncio.CancelledError:
+                pass
+
+        if self.stream_monitor_task:
+            self.stream_monitor_task.cancel()
+            try:
+                await self.stream_monitor_task
+            except asyncio.CancelledError:
+                pass
+
+        if self.subscription_retry_manager_task:
+            self.subscription_retry_manager_task.cancel()
+            try:
+                await self.subscription_retry_manager_task
+            except asyncio.CancelledError:
+                pass
                 
         if self.websocket:
             try:
@@ -1160,37 +1291,12 @@ class BybitWebSocketClient:
         logger.info("🛑 WebSocket клиент остановлен")
 
     def get_subscription_stats(self) -> Dict:
-        """Получить расширенную статистику подписок"""
-        current_time = datetime.utcnow()
-        
-        # Подсчитываем активные потоки
-        active_streams = 0
-        for symbol, last_time in self.last_stream_data.items():
-            if last_time and (current_time - last_time).total_seconds() < self.stream_timeout_seconds:
-                active_streams += 1
-        
-        # Статистика по парам
-        pair_stats = {}
-        for symbol, stats in self.pair_statistics.items():
-            last_message_age = None
-            if stats['last_message']:
-                last_message_age = (current_time - stats['last_message']).total_seconds()
-            
-            pair_stats[symbol] = {
-                'messages': stats['messages'],
-                'last_message_age_seconds': last_message_age,
-                'errors': stats['errors'],
-                'subscription_attempts': stats['subscription_attempts'],
-                'is_active': symbol in self.last_stream_data and 
-                           self.last_stream_data[symbol] and 
-                           (current_time - self.last_stream_data[symbol]).total_seconds() < self.stream_timeout_seconds
-            }
-
+        """Получить статистику подписок"""
         return {
             'total_pairs': len(self.trading_pairs),
             'subscribed_pairs': len(self.subscribed_pairs),
             'pending_pairs': len(self.subscription_pending),
-            'failed_subscriptions': len(self.failed_subscriptions),
+            'failed_pairs': len(self.failed_subscriptions),
             'last_update': self.last_subscription_update.isoformat() if self.last_subscription_update else None,
             'subscription_rate': len(self.subscribed_pairs) / len(
                 self.trading_pairs) * 100 if self.trading_pairs else 0,
@@ -1201,8 +1307,9 @@ class BybitWebSocketClient:
             'reconnect_attempts': self.reconnect_attempts,
             'max_reconnect_attempts': self.max_reconnect_attempts,
             'messages_received': self.messages_received,
-            'active_streams': active_streams,
-            'inactive_streams': len(self.trading_pairs) - active_streams,
-            'pair_statistics': pair_stats,
-            'failed_subscription_list': list(self.failed_subscriptions)
+            'active_streams': len([s for s, t in self.last_stream_data.items() 
+                                 if (datetime.utcnow() - t).total_seconds() < self.stream_timeout_seconds]),
+            'pair_statistics': self.pair_statistics,
+            'data_load_times': {symbol: datetime.utcfromtimestamp(timestamp/1000).isoformat() 
+                               for symbol, timestamp in self.last_data_load_time.items()}
         }

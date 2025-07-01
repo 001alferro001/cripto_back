@@ -598,6 +598,64 @@ class DatabaseManager:
         finally:
             cursor.close()
 
+    async def get_data_age_info(self, symbol: str) -> Dict:
+        """Получить информацию о возрасте данных для символа"""
+        cursor = self.connection.cursor()
+        try:
+            # Получаем время самой старой и самой новой свечи
+            cursor.execute("""
+                SELECT 
+                    MIN(timestamp_ms) as oldest_candle,
+                    MAX(timestamp_ms) as newest_candle,
+                    COUNT(*) as total_candles
+                FROM kline_data 
+                WHERE symbol = %s AND is_closed = TRUE
+            """, (symbol,))
+            
+            result = cursor.fetchone()
+            
+            if result and result[0] and result[1]:
+                oldest_ms, newest_ms, total_candles = result
+                current_time_ms = int(datetime.utcnow().timestamp() * 1000)
+                
+                # Возраст данных в часах
+                data_age_hours = (current_time_ms - newest_ms) / (1000 * 60 * 60)
+                data_span_hours = (newest_ms - oldest_ms) / (1000 * 60 * 60)
+                
+                return {
+                    'oldest_candle_ms': oldest_ms,
+                    'newest_candle_ms': newest_ms,
+                    'total_candles': total_candles,
+                    'data_age_hours': data_age_hours,
+                    'data_span_hours': data_span_hours,
+                    'oldest_candle_time': datetime.utcfromtimestamp(oldest_ms / 1000).isoformat(),
+                    'newest_candle_time': datetime.utcfromtimestamp(newest_ms / 1000).isoformat()
+                }
+            else:
+                return {
+                    'oldest_candle_ms': None,
+                    'newest_candle_ms': None,
+                    'total_candles': 0,
+                    'data_age_hours': float('inf'),
+                    'data_span_hours': 0,
+                    'oldest_candle_time': None,
+                    'newest_candle_time': None
+                }
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения информации о возрасте данных для {symbol}: {type(e).__name__}: {str(e)}")
+            return {
+                'oldest_candle_ms': None,
+                'newest_candle_ms': None,
+                'total_candles': 0,
+                'data_age_hours': float('inf'),
+                'data_span_hours': 0,
+                'oldest_candle_time': None,
+                'newest_candle_time': None
+            }
+        finally:
+            cursor.close()
+
     async def cleanup_old_candles(self, symbol: str, hours: int):
         """Очистить старые свечи"""
         cursor = self.connection.cursor()
