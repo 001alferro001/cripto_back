@@ -3,8 +3,9 @@ import logging
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from datetime import datetime, timedelta, timezone
+from psycopg2 import sql
 from typing import List, Dict, Optional, Any
+from datetime import datetime, timedelta, timezone
 import json
 
 logger = logging.getLogger(__name__)
@@ -16,7 +17,7 @@ class DatabaseManager:
         self.db_config = {
             'host': os.getenv('DB_HOST', 'localhost'),
             'port': int(os.getenv('DB_PORT', 5432)),
-            'database': os.getenv('DB_NAME', 'tradingbase'),
+            'database': os.getenv('DB_NAME', 'trading_analyzer'),
             'user': os.getenv('DB_USER', 'postgres'),
             'password': os.getenv('DB_PASSWORD', 'password')
         }
@@ -26,20 +27,17 @@ class DatabaseManager:
         try:
             self.connection = psycopg2.connect(**self.db_config)
             self.connection.autocommit = True
-            logger.info("Подключение к базе данных установлено")
-
             await self.create_tables()
-            logger.info("Таблицы базы данных проверены/созданы")
-
+            logger.info("✅ База данных инициализирована")
         except Exception as e:
-            logger.error(f"Ошибка подключения к базе данных: {e}")
+            logger.error(f"❌ Ошибка инициализации базы данных: {e}")
             raise
 
     async def create_tables(self):
         """Создание необходимых таблиц"""
+        cursor = self.connection.cursor()
+        
         try:
-            cursor = self.connection.cursor()
-
             # Таблица торговых пар
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS watchlist (
@@ -49,71 +47,54 @@ class DatabaseManager:
                     price_drop_percentage FLOAT,
                     current_price FLOAT,
                     historical_price FLOAT,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    added_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
 
-            # Таблица исторических свечных данных (закрытые свечи)
+            # Таблица свечных данных
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS kline_data (
                     id SERIAL PRIMARY KEY,
                     symbol VARCHAR(20) NOT NULL,
-                    open_time_ms BIGINT NOT NULL,
-                    close_time_ms BIGINT NOT NULL,
+                    timestamp_ms BIGINT NOT NULL,
                     open_price DECIMAL(20, 8) NOT NULL,
                     high_price DECIMAL(20, 8) NOT NULL,
                     low_price DECIMAL(20, 8) NOT NULL,
                     close_price DECIMAL(20, 8) NOT NULL,
                     volume DECIMAL(20, 8) NOT NULL,
-                    volume_usdt DECIMAL(20, 8) NOT NULL,
-                    is_long BOOLEAN NOT NULL,
-                    is_closed BOOLEAN DEFAULT TRUE,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    UNIQUE(symbol, open_time_ms)
-                )
-            """)
-
-            # Новая таблица для потоковых данных (формирующиеся свечи)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS streaming_kline_data (
-                    id SERIAL PRIMARY KEY,
-                    symbol VARCHAR(20) NOT NULL,
-                    open_time_ms BIGINT NOT NULL,
-                    close_time_ms BIGINT NOT NULL,
-                    open_price DECIMAL(20, 8) NOT NULL,
-                    high_price DECIMAL(20, 8) NOT NULL,
-                    low_price DECIMAL(20, 8) NOT NULL,
-                    close_price DECIMAL(20, 8) NOT NULL,
-                    volume DECIMAL(20, 8) NOT NULL,
-                    volume_usdt DECIMAL(20, 8) NOT NULL,
-                    is_long BOOLEAN NOT NULL,
                     is_closed BOOLEAN DEFAULT FALSE,
-                    last_updated TIMESTAMPTZ DEFAULT NOW(),
+                    is_long BOOLEAN,
                     created_at TIMESTAMPTZ DEFAULT NOW(),
-                    UNIQUE(symbol, open_time_ms)
+                    UNIQUE(symbol, timestamp_ms)
                 )
             """)
 
             # Индексы для оптимизации
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_kline_symbol_time 
-                ON kline_data(symbol, open_time_ms DESC)
+                CREATE INDEX IF NOT EXISTS idx_kline_symbol_timestamp 
+                ON kline_data(symbol, timestamp_ms DESC)
             """)
-
+            
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_kline_symbol_closed 
-                ON kline_data(symbol, is_closed, open_time_ms DESC)
+                ON kline_data(symbol, is_closed, timestamp_ms DESC)
             """)
 
+            # Таблица потоковых данных
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_streaming_kline_symbol_time 
-                ON streaming_kline_data(symbol, open_time_ms DESC)
-            """)
-
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_streaming_kline_last_updated 
-                ON streaming_kline_data(last_updated DESC)
+                CREATE TABLE IF NOT EXISTS streaming_data (
+                    id SERIAL PRIMARY KEY,
+                    symbol VARCHAR(20) NOT NULL,
+                    timestamp_ms BIGINT NOT NULL,
+                    open_price DECIMAL(20, 8) NOT NULL,
+                    high_price DECIMAL(20, 8) NOT NULL,
+                    low_price DECIMAL(20, 8) NOT NULL,
+                    close_price DECIMAL(20, 8) NOT NULL,
+                    volume DECIMAL(20, 8) NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(symbol, timestamp_ms)
+                )
             """)
 
             # Таблица алертов
@@ -123,12 +104,12 @@ class DatabaseManager:
                     symbol VARCHAR(20) NOT NULL,
                     alert_type VARCHAR(50) NOT NULL,
                     price DECIMAL(20, 8) NOT NULL,
+                    volume_ratio FLOAT,
+                    current_volume_usdt BIGINT,
+                    average_volume_usdt BIGINT,
+                    consecutive_count INTEGER,
                     alert_timestamp_ms BIGINT NOT NULL,
                     close_timestamp_ms BIGINT,
-                    volume_ratio FLOAT,
-                    consecutive_count INTEGER,
-                    current_volume_usdt DECIMAL(20, 2),
-                    average_volume_usdt DECIMAL(20, 2),
                     is_closed BOOLEAN DEFAULT FALSE,
                     is_true_signal BOOLEAN,
                     has_imbalance BOOLEAN DEFAULT FALSE,
@@ -161,14 +142,8 @@ class DatabaseManager:
                     max_risk_per_trade DECIMAL(5, 2) DEFAULT 2.0,
                     max_open_trades INTEGER DEFAULT 5,
                     default_stop_loss_percentage DECIMAL(5, 2) DEFAULT 2.0,
-                    default_take_profit_percentage DECIMAL(5, 2) DEFAULT 6.0,
+                    default_take_profit_percentage DECIMAL(5, 2) DEFAULT 4.0,
                     auto_calculate_quantity BOOLEAN DEFAULT TRUE,
-                    api_key VARCHAR(255),
-                    api_secret VARCHAR(255),
-                    enable_real_trading BOOLEAN DEFAULT FALSE,
-                    default_leverage INTEGER DEFAULT 1,
-                    default_margin_type VARCHAR(10) DEFAULT 'isolated',
-                    confirm_trades BOOLEAN DEFAULT TRUE,
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
@@ -180,496 +155,473 @@ class DatabaseManager:
                     symbol VARCHAR(20) NOT NULL,
                     trade_type VARCHAR(10) NOT NULL,
                     entry_price DECIMAL(20, 8) NOT NULL,
+                    exit_price DECIMAL(20, 8),
                     quantity DECIMAL(20, 8) NOT NULL,
                     stop_loss DECIMAL(20, 8),
                     take_profit DECIMAL(20, 8),
-                    risk_amount DECIMAL(20, 2) NOT NULL,
-                    risk_percentage DECIMAL(5, 2) NOT NULL,
+                    risk_amount DECIMAL(20, 2),
+                    risk_percentage DECIMAL(5, 2),
                     potential_profit DECIMAL(20, 2),
                     potential_loss DECIMAL(20, 2),
                     risk_reward_ratio DECIMAL(10, 2),
+                    actual_profit_loss DECIMAL(20, 2),
                     status VARCHAR(20) DEFAULT 'OPEN',
-                    exit_price DECIMAL(20, 8),
                     exit_reason VARCHAR(50),
-                    pnl DECIMAL(20, 2),
-                    pnl_percentage DECIMAL(10, 2),
                     notes TEXT,
                     alert_id INTEGER,
-                    opened_at_ms BIGINT NOT NULL,
-                    closed_at_ms BIGINT,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                    entry_time TIMESTAMPTZ DEFAULT NOW(),
+                    exit_time TIMESTAMPTZ
                 )
             """)
 
-            cursor.close()
-            logger.info("Все таблицы созданы/проверены")
+            # Вставляем настройки по умолчанию, если их нет
+            cursor.execute("""
+                INSERT INTO trading_settings (id) 
+                SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM trading_settings WHERE id = 1)
+            """)
+
+            logger.info("✅ Таблицы созданы успешно")
 
         except Exception as e:
-            logger.error(f"Ошибка создания таблиц: {e}")
+            logger.error(f"❌ Ошибка создания таблиц: {e}")
             raise
-
-    async def save_historical_kline_data(self, symbol: str, kline_data: Dict):
-        """Сохранение исторических данных свечи (только закрытые свечи)"""
-        try:
-            cursor = self.connection.cursor()
-
-            open_time_ms = int(kline_data['start'])
-            close_time_ms = int(kline_data['end'])
-            open_price = float(kline_data['open'])
-            high_price = float(kline_data['high'])
-            low_price = float(kline_data['low'])
-            close_price = float(kline_data['close'])
-            volume = float(kline_data['volume'])
-            volume_usdt = volume * close_price
-            is_long = close_price > open_price
-
-            cursor.execute("""
-                INSERT INTO kline_data (
-                    symbol, open_time_ms, close_time_ms, open_price, high_price, 
-                    low_price, close_price, volume, volume_usdt, is_long, is_closed
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (symbol, open_time_ms) 
-                DO UPDATE SET
-                    close_time_ms = EXCLUDED.close_time_ms,
-                    high_price = EXCLUDED.high_price,
-                    low_price = EXCLUDED.low_price,
-                    close_price = EXCLUDED.close_price,
-                    volume = EXCLUDED.volume,
-                    volume_usdt = EXCLUDED.volume_usdt,
-                    is_long = EXCLUDED.is_long,
-                    is_closed = EXCLUDED.is_closed
-            """, (symbol, open_time_ms, close_time_ms, open_price, high_price,
-                  low_price, close_price, volume, volume_usdt, is_long, True))
-
-            cursor.close()
-            logger.debug(f"Сохранены исторические данные для {symbol}: {open_time_ms}")
-
-        except Exception as e:
-            logger.error(f"Ошибка сохранения исторических данных свечи для {symbol}: {e}")
-
-    async def save_streaming_kline_data(self, symbol: str, kline_data: Dict, is_closed: bool = False):
-        """Сохранение потоковых данных свечи"""
-        try:
-            cursor = self.connection.cursor()
-
-            open_time_ms = int(kline_data['start'])
-            close_time_ms = int(kline_data['end'])
-            open_price = float(kline_data['open'])
-            high_price = float(kline_data['high'])
-            low_price = float(kline_data['low'])
-            close_price = float(kline_data['close'])
-            volume = float(kline_data['volume'])
-            volume_usdt = volume * close_price
-            is_long = close_price > open_price
-
-            if is_closed:
-                # Если свеча закрылась, перемещаем её в основную таблицу и удаляем из потоковой
-                cursor.execute("""
-                    INSERT INTO kline_data (
-                        symbol, open_time_ms, close_time_ms, open_price, high_price, 
-                        low_price, close_price, volume, volume_usdt, is_long, is_closed
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (symbol, open_time_ms) 
-                    DO UPDATE SET
-                        close_time_ms = EXCLUDED.close_time_ms,
-                        high_price = EXCLUDED.high_price,
-                        low_price = EXCLUDED.low_price,
-                        close_price = EXCLUDED.close_price,
-                        volume = EXCLUDED.volume,
-                        volume_usdt = EXCLUDED.volume_usdt,
-                        is_long = EXCLUDED.is_long,
-                        is_closed = EXCLUDED.is_closed
-                """, (symbol, open_time_ms, close_time_ms, open_price, high_price,
-                      low_price, close_price, volume, volume_usdt, is_long, True))
-
-                # Удаляем из потоковой таблицы
-                cursor.execute("""
-                    DELETE FROM streaming_kline_data 
-                    WHERE symbol = %s AND open_time_ms = %s
-                """, (symbol, open_time_ms))
-
-                logger.debug(f"Закрытая свеча перемещена в основную таблицу: {symbol} {open_time_ms}")
-            else:
-                # Обновляем потоковые данные
-                cursor.execute("""
-                    INSERT INTO streaming_kline_data (
-                        symbol, open_time_ms, close_time_ms, open_price, high_price, 
-                        low_price, close_price, volume, volume_usdt, is_long, is_closed, last_updated
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (symbol, open_time_ms) 
-                    DO UPDATE SET
-                        close_time_ms = EXCLUDED.close_time_ms,
-                        high_price = EXCLUDED.high_price,
-                        low_price = EXCLUDED.low_price,
-                        close_price = EXCLUDED.close_price,
-                        volume = EXCLUDED.volume,
-                        volume_usdt = EXCLUDED.volume_usdt,
-                        is_long = EXCLUDED.is_long,
-                        last_updated = NOW()
-                """, (symbol, open_time_ms, close_time_ms, open_price, high_price,
-                      low_price, close_price, volume, volume_usdt, is_long, False))
-
-                logger.debug(f"Обновлены потоковые данные для {symbol}: {open_time_ms}")
-
+        finally:
             cursor.close()
 
-        except Exception as e:
-            logger.error(f"Ошибка сохранения потоковых данных свечи для {symbol}: {e}")
-
-    async def save_kline_data(self, symbol: str, kline_data: Dict, is_closed: bool = False):
-        """Универсальный метод сохранения данных свечи"""
-        if is_closed:
-            await self.save_streaming_kline_data(symbol, kline_data, is_closed=True)
-        else:
-            await self.save_streaming_kline_data(symbol, kline_data, is_closed=False)
-
-    async def get_recent_candles(self, symbol: str, count: int = 20) -> List[Dict]:
-        """Получение последних свечей для символа (только закрытые)"""
-        try:
-            cursor = self.connection.cursor(cursor_factory=RealDictCursor)
-
-            cursor.execute("""
-                SELECT 
-                    open_time_ms as timestamp,
-                    open_price as open,
-                    high_price as high,
-                    low_price as low,
-                    close_price as close,
-                    volume,
-                    volume_usdt,
-                    is_long,
-                    is_closed
-                FROM kline_data 
-                WHERE symbol = %s AND is_closed = TRUE
-                ORDER BY open_time_ms DESC 
-                LIMIT %s
-            """, (symbol, count))
-
-            rows = cursor.fetchall()
-            cursor.close()
-
-            # Преобразуем в список словарей и сортируем по времени (старые первыми)
-            candles = []
-            for row in reversed(rows):
-                candles.append({
-                    'timestamp': int(row['timestamp']),
-                    'open': float(row['open']),
-                    'high': float(row['high']),
-                    'low': float(row['low']),
-                    'close': float(row['close']),
-                    'volume': float(row['volume']),
-                    'volume_usdt': float(row['volume_usdt']),
-                    'is_long': row['is_long'],
-                    'is_closed': row['is_closed']
-                })
-
-            return candles
-
-        except Exception as e:
-            logger.error(f"Ошибка получения последних свечей для {symbol}: {e}")
-            return []
-
-    async def get_streaming_candles(self, symbol: str = None) -> List[Dict]:
-        """Получение текущих потоковых свечей"""
-        try:
-            cursor = self.connection.cursor(cursor_factory=RealDictCursor)
-
-            if symbol:
-                cursor.execute("""
-                    SELECT 
-                        symbol,
-                        open_time_ms as timestamp,
-                        open_price as open,
-                        high_price as high,
-                        low_price as low,
-                        close_price as close,
-                        volume,
-                        volume_usdt,
-                        is_long,
-                        is_closed,
-                        last_updated
-                    FROM streaming_kline_data 
-                    WHERE symbol = %s
-                    ORDER BY open_time_ms DESC
-                """, (symbol,))
-            else:
-                cursor.execute("""
-                    SELECT 
-                        symbol,
-                        open_time_ms as timestamp,
-                        open_price as open,
-                        high_price as high,
-                        low_price as low,
-                        close_price as close,
-                        volume,
-                        volume_usdt,
-                        is_long,
-                        is_closed,
-                        last_updated
-                    FROM streaming_kline_data 
-                    ORDER BY last_updated DESC
-                """)
-
-            rows = cursor.fetchall()
-            cursor.close()
-
-            candles = []
-            for row in rows:
-                candles.append({
-                    'symbol': row['symbol'],
-                    'timestamp': int(row['timestamp']),
-                    'open': float(row['open']),
-                    'high': float(row['high']),
-                    'low': float(row['low']),
-                    'close': float(row['close']),
-                    'volume': float(row['volume']),
-                    'volume_usdt': float(row['volume_usdt']),
-                    'is_long': row['is_long'],
-                    'is_closed': row['is_closed'],
-                    'last_updated': row['last_updated']
-                })
-
-            return candles
-
-        except Exception as e:
-            logger.error(f"Ошибка получения потоковых свечей: {e}")
-            return []
-
-    async def check_candle_exists(self, symbol: str, timestamp_ms: int) -> bool:
-        """Проверка существования свечи в основной таблице"""
-        try:
-            cursor = self.connection.cursor()
-            cursor.execute("""
-                SELECT 1 FROM kline_data 
-                WHERE symbol = %s AND open_time_ms = %s
-                LIMIT 1
-            """, (symbol, timestamp_ms))
-
-            result = cursor.fetchone()
-            cursor.close()
-
-            return result is not None
-
-        except Exception as e:
-            logger.error(f"Ошибка проверки существования свечи: {e}")
-            return False
-
-    async def get_historical_long_volumes(self, symbol: str, hours: int, offset_minutes: int = 0,
-                                          volume_type: str = 'long') -> List[float]:
-        """Получение исторических объемов LONG свечей"""
-        try:
-            cursor = self.connection.cursor()
-
-            # Рассчитываем временные границы
-            current_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            end_time_ms = current_time_ms - (offset_minutes * 60 * 1000)
-            start_time_ms = end_time_ms - (hours * 60 * 60 * 1000)
-
-            # Формируем условие в зависимости от типа объема
-            volume_condition = ""
-            if volume_type == 'long':
-                volume_condition = "AND is_long = TRUE"
-            elif volume_type == 'short':
-                volume_condition = "AND is_long = FALSE"
-            # Для 'all' не добавляем условие
-
-            cursor.execute(f"""
-                SELECT volume_usdt 
-                FROM kline_data 
-                WHERE symbol = %s 
-                AND open_time_ms >= %s 
-                AND open_time_ms < %s 
-                AND is_closed = TRUE
-                {volume_condition}
-                ORDER BY open_time_ms
-            """, (symbol, start_time_ms, end_time_ms))
-
-            rows = cursor.fetchall()
-            cursor.close()
-
-            return [float(row[0]) for row in rows]
-
-        except Exception as e:
-            logger.error(f"Ошибка получения исторических объемов для {symbol}: {e}")
-            return []
-
-    async def cleanup_old_candles(self, symbol: str, retention_hours: int):
-        """Очистка старых свечей для символа"""
-        try:
-            cursor = self.connection.cursor()
-
-            # Рассчитываем время отсечения
-            cutoff_time_ms = int((datetime.now(timezone.utc) - timedelta(hours=retention_hours)).timestamp() * 1000)
-
-            # Очищаем основную таблицу
-            cursor.execute("""
-                DELETE FROM kline_data 
-                WHERE symbol = %s AND open_time_ms < %s
-            """, (symbol, cutoff_time_ms))
-
-            deleted_count = cursor.rowcount
-
-            # Очищаем старые потоковые данные (старше 1 часа)
-            stream_cutoff_time_ms = int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000)
-            cursor.execute("""
-                DELETE FROM streaming_kline_data 
-                WHERE symbol = %s AND open_time_ms < %s
-            """, (symbol, stream_cutoff_time_ms))
-
-            deleted_stream_count = cursor.rowcount
-            cursor.close()
-
-            if deleted_count > 0 or deleted_stream_count > 0:
-                logger.debug(f"Удалено {deleted_count} старых свечей и {deleted_stream_count} потоковых данных для {symbol}")
-
-        except Exception as e:
-            logger.error(f"Ошибка очистки старых свечей для {symbol}: {e}")
-
-    async def check_data_integrity(self, symbol: str, hours: int) -> Dict:
-        """Проверка целостности данных для символа"""
-        try:
-            cursor = self.connection.cursor()
-
-            # Рассчитываем ожидаемое количество свечей
-            expected_candles = hours * 60  # 1 свеча в минуту
-
-            # Рассчитываем временные границы
-            current_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            start_time_ms = current_time_ms - (hours * 60 * 60 * 1000)
-
-            # Считаем существующие свечи
-            cursor.execute("""
-                SELECT COUNT(*) 
-                FROM kline_data 
-                WHERE symbol = %s 
-                AND open_time_ms >= %s 
-                AND is_closed = TRUE
-            """, (symbol, start_time_ms))
-
-            existing_count = cursor.fetchone()[0]
-            cursor.close()
-
-            # Рассчитываем процент целостности
-            integrity_percentage = (existing_count / expected_candles * 100) if expected_candles > 0 else 0
-            missing_count = max(0, expected_candles - existing_count)
-
-            return {
-                'total_expected': expected_candles,
-                'total_existing': existing_count,
-                'missing_count': missing_count,
-                'integrity_percentage': integrity_percentage
-            }
-
-        except Exception as e:
-            logger.error(f"Ошибка проверки целостности данных для {symbol}: {e}")
-            return {
-                'total_expected': 0,
-                'total_existing': 0,
-                'missing_count': 0,
-                'integrity_percentage': 0
-            }
-
+    # Методы для работы с watchlist
     async def get_watchlist(self) -> List[str]:
-        """Получение списка активных торговых пар"""
+        """Получить список активных торговых пар"""
+        cursor = self.connection.cursor()
         try:
-            cursor = self.connection.cursor()
             cursor.execute("SELECT symbol FROM watchlist WHERE is_active = TRUE ORDER BY symbol")
-            rows = cursor.fetchall()
-            cursor.close()
-            return [row[0] for row in rows]
+            return [row[0] for row in cursor.fetchall()]
         except Exception as e:
-            logger.error(f"Ошибка получения watchlist: {e}")
+            logger.error(f"❌ Ошибка получения watchlist: {e}")
             return []
+        finally:
+            cursor.close()
 
     async def get_watchlist_details(self) -> List[Dict]:
-        """Получение детальной информации о торговых парах"""
+        """Получить детальную информацию о торговых парах"""
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
         try:
-            cursor = self.connection.cursor(cursor_factory=RealDictCursor)
             cursor.execute("""
-                SELECT w.*, 
-                       CASE WHEN f.symbol IS NOT NULL THEN TRUE ELSE FALSE END as is_favorite
-                FROM watchlist w
-                LEFT JOIN favorites f ON w.symbol = f.symbol
-                ORDER BY w.symbol
+                SELECT id, symbol, is_active, price_drop_percentage, 
+                       current_price, historical_price, added_at, updated_at
+                FROM watchlist 
+                ORDER BY symbol
             """)
-            rows = cursor.fetchall()
-            cursor.close()
-            return [dict(row) for row in rows]
+            return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
-            logger.error(f"Ошибка получения детальной информации watchlist: {e}")
+            logger.error(f"❌ Ошибка получения деталей watchlist: {e}")
             return []
+        finally:
+            cursor.close()
 
-    async def add_to_watchlist(self, symbol: str, price_drop: float = None, current_price: float = None,
-                               historical_price: float = None):
-        """Добавление торговой пары в watchlist"""
+    async def add_to_watchlist(self, symbol: str, price_drop: float = None, 
+                              current_price: float = None, historical_price: float = None):
+        """Добавить торговую пару в watchlist"""
+        cursor = self.connection.cursor()
         try:
-            cursor = self.connection.cursor()
             cursor.execute("""
                 INSERT INTO watchlist (symbol, price_drop_percentage, current_price, historical_price)
                 VALUES (%s, %s, %s, %s)
-                ON CONFLICT (symbol) 
-                DO UPDATE SET
+                ON CONFLICT (symbol) DO UPDATE SET
                     is_active = TRUE,
                     price_drop_percentage = EXCLUDED.price_drop_percentage,
                     current_price = EXCLUDED.current_price,
                     historical_price = EXCLUDED.historical_price,
                     updated_at = NOW()
             """, (symbol, price_drop, current_price, historical_price))
-            cursor.close()
-            logger.info(f"Добавлена пара {symbol} в watchlist")
+            logger.info(f"✅ Добавлена пара {symbol} в watchlist")
         except Exception as e:
-            logger.error(f"Ошибка добавления {symbol} в watchlist: {e}")
+            logger.error(f"❌ Ошибка добавления {symbol} в watchlist: {e}")
+            raise
+        finally:
+            cursor.close()
 
     async def remove_from_watchlist(self, symbol: str = None, item_id: int = None):
-        """Удаление торговой пары из watchlist"""
+        """Удалить торговую пару из watchlist"""
+        cursor = self.connection.cursor()
         try:
-            cursor = self.connection.cursor()
             if item_id:
                 cursor.execute("DELETE FROM watchlist WHERE id = %s", (item_id,))
             elif symbol:
                 cursor.execute("DELETE FROM watchlist WHERE symbol = %s", (symbol,))
-            cursor.close()
-            logger.info(f"Удалена пара из watchlist: {symbol or item_id}")
+            logger.info(f"✅ Удалена пара из watchlist")
         except Exception as e:
-            logger.error(f"Ошибка удаления из watchlist: {e}")
+            logger.error(f"❌ Ошибка удаления из watchlist: {e}")
+            raise
+        finally:
+            cursor.close()
 
     async def update_watchlist_item(self, item_id: int, symbol: str, is_active: bool):
-        """Обновление элемента watchlist"""
+        """Обновить элемент watchlist"""
+        cursor = self.connection.cursor()
         try:
-            cursor = self.connection.cursor()
             cursor.execute("""
                 UPDATE watchlist 
                 SET symbol = %s, is_active = %s, updated_at = NOW()
                 WHERE id = %s
             """, (symbol, is_active, item_id))
-            cursor.close()
         except Exception as e:
-            logger.error(f"Ошибка обновления watchlist: {e}")
+            logger.error(f"❌ Ошибка обновления watchlist: {e}")
+            raise
+        finally:
+            cursor.close()
 
-    async def save_alert(self, alert_data: Dict) -> int:
-        """Сохранение алерта в базу данных"""
+    # Методы для работы с kline данными
+    async def save_kline_data(self, symbol: str, kline_data: Dict, is_closed: bool = False):
+        """Сохранить данные свечи"""
+        cursor = self.connection.cursor()
         try:
-            cursor = self.connection.cursor()
+            timestamp_ms = int(kline_data['start'])
+            open_price = float(kline_data['open'])
+            high_price = float(kline_data['high'])
+            low_price = float(kline_data['low'])
+            close_price = float(kline_data['close'])
+            volume = float(kline_data['volume'])
+            is_long = close_price > open_price
 
+            if is_closed:
+                # Для закрытых свечей сохраняем в основную таблицу
+                cursor.execute("""
+                    INSERT INTO kline_data (symbol, timestamp_ms, open_price, high_price, 
+                                          low_price, close_price, volume, is_closed, is_long)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (symbol, timestamp_ms) DO UPDATE SET
+                        open_price = EXCLUDED.open_price,
+                        high_price = EXCLUDED.high_price,
+                        low_price = EXCLUDED.low_price,
+                        close_price = EXCLUDED.close_price,
+                        volume = EXCLUDED.volume,
+                        is_closed = EXCLUDED.is_closed,
+                        is_long = EXCLUDED.is_long
+                """, (symbol, timestamp_ms, open_price, high_price, low_price, 
+                     close_price, volume, is_closed, is_long))
+            else:
+                # Для потоковых данных сохраняем в отдельную таблицу
+                cursor.execute("""
+                    INSERT INTO streaming_data (symbol, timestamp_ms, open_price, high_price,
+                                              low_price, close_price, volume)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (symbol, timestamp_ms) DO UPDATE SET
+                        open_price = EXCLUDED.open_price,
+                        high_price = EXCLUDED.high_price,
+                        low_price = EXCLUDED.low_price,
+                        close_price = EXCLUDED.close_price,
+                        volume = EXCLUDED.volume,
+                        updated_at = NOW()
+                """, (symbol, timestamp_ms, open_price, high_price, low_price, close_price, volume))
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения kline данных для {symbol}: {e}")
+            raise
+        finally:
+            cursor.close()
+
+    async def save_historical_kline_data(self, symbol: str, kline_data: Dict):
+        """Сохранить исторические данные свечи"""
+        await self.save_kline_data(symbol, kline_data, is_closed=True)
+
+    async def check_candle_exists(self, symbol: str, timestamp_ms: int) -> bool:
+        """Проверить существование свечи"""
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute("""
+                SELECT 1 FROM kline_data 
+                WHERE symbol = %s AND timestamp_ms = %s
+            """, (symbol, timestamp_ms))
+            return cursor.fetchone() is not None
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки существования свечи: {e}")
+            return False
+        finally:
+            cursor.close()
+
+    async def get_recent_candles(self, symbol: str, count: int = 20) -> List[Dict]:
+        """Получить последние свечи для символа"""
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+        try:
+            cursor.execute("""
+                SELECT timestamp_ms as timestamp, open_price as open, high_price as high,
+                       low_price as low, close_price as close, volume, is_long, is_closed
+                FROM kline_data 
+                WHERE symbol = %s AND is_closed = TRUE
+                ORDER BY timestamp_ms DESC 
+                LIMIT %s
+            """, (symbol, count))
+            
+            candles = []
+            for row in cursor.fetchall():
+                candles.append({
+                    'timestamp': row['timestamp'],
+                    'open': float(row['open']),
+                    'high': float(row['high']),
+                    'low': float(row['low']),
+                    'close': float(row['close']),
+                    'volume': float(row['volume']),
+                    'is_long': row['is_long'],
+                    'is_closed': row['is_closed']
+                })
+            
+            # Возвращаем в хронологическом порядке
+            return list(reversed(candles))
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения последних свечей для {symbol}: {e}")
+            return []
+        finally:
+            cursor.close()
+
+    async def get_streaming_candles(self, symbol: str = None) -> List[Dict]:
+        """Получить потоковые данные"""
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+        try:
+            if symbol:
+                cursor.execute("""
+                    SELECT symbol, timestamp_ms, open_price, high_price, low_price, 
+                           close_price, volume, updated_at
+                    FROM streaming_data 
+                    WHERE symbol = %s
+                    ORDER BY timestamp_ms DESC
+                """, (symbol,))
+            else:
+                cursor.execute("""
+                    SELECT symbol, timestamp_ms, open_price, high_price, low_price, 
+                           close_price, volume, updated_at
+                    FROM streaming_data 
+                    ORDER BY symbol, timestamp_ms DESC
+                """)
+            
+            return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения потоковых данных: {e}")
+            return []
+        finally:
+            cursor.close()
+
+    async def check_data_integrity(self, symbol: str, hours: int) -> Dict:
+        """Проверить целостность данных за указанный период"""
+        cursor = self.connection.cursor()
+        try:
+            # Определяем временной диапазон
+            end_time_ms = int(datetime.utcnow().timestamp() * 1000)
+            start_time_ms = end_time_ms - (hours * 60 * 60 * 1000)
+            
+            # Ожидаемое количество свечей
+            expected_count = hours * 60
+            
+            # Фактическое количество свечей
+            cursor.execute("""
+                SELECT COUNT(*) FROM kline_data 
+                WHERE symbol = %s AND timestamp_ms >= %s AND timestamp_ms < %s
+                AND is_closed = TRUE
+            """, (symbol, start_time_ms, end_time_ms))
+            
+            actual_count = cursor.fetchone()[0]
+            
+            # Рассчитываем процент целостности
+            integrity_percentage = (actual_count / expected_count * 100) if expected_count > 0 else 0
+            missing_count = max(0, expected_count - actual_count)
+            
+            return {
+                'total_expected': expected_count,
+                'total_existing': actual_count,
+                'missing_count': missing_count,
+                'integrity_percentage': integrity_percentage
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки целостности данных для {symbol}: {e}")
+            return {
+                'total_expected': 0,
+                'total_existing': 0,
+                'missing_count': 0,
+                'integrity_percentage': 0
+            }
+        finally:
+            cursor.close()
+
+    async def check_data_integrity_range(self, symbol: str, start_time_ms: int, end_time_ms: int) -> Dict:
+        """Проверить целостность данных в указанном диапазоне"""
+        cursor = self.connection.cursor()
+        try:
+            # Ожидаемое количество свечей (в минутах)
+            expected_count = (end_time_ms - start_time_ms) // 60000
+            
+            # Фактическое количество свечей
+            cursor.execute("""
+                SELECT COUNT(*) FROM kline_data 
+                WHERE symbol = %s AND timestamp_ms >= %s AND timestamp_ms < %s
+                AND is_closed = TRUE
+            """, (symbol, start_time_ms, end_time_ms))
+            
+            actual_count = cursor.fetchone()[0]
+            
+            # Рассчитываем процент целостности
+            integrity_percentage = (actual_count / expected_count * 100) if expected_count > 0 else 0
+            missing_count = max(0, expected_count - actual_count)
+            
+            return {
+                'total_expected': expected_count,
+                'total_existing': actual_count,
+                'missing_count': missing_count,
+                'integrity_percentage': integrity_percentage
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки целостности данных в диапазоне для {symbol}: {e}")
+            return {
+                'total_expected': 0,
+                'total_existing': 0,
+                'missing_count': 0,
+                'integrity_percentage': 0
+            }
+        finally:
+            cursor.close()
+
+    async def cleanup_old_candles(self, symbol: str, hours: int):
+        """Очистить старые свечи"""
+        cursor = self.connection.cursor()
+        try:
+            cutoff_time_ms = int((datetime.utcnow() - timedelta(hours=hours)).timestamp() * 1000)
+            
+            cursor.execute("""
+                DELETE FROM kline_data 
+                WHERE symbol = %s AND timestamp_ms < %s
+            """, (symbol, cutoff_time_ms))
+            
+            deleted_count = cursor.rowcount
+            if deleted_count > 0:
+                logger.debug(f"🧹 Удалено {deleted_count} старых свечей для {symbol}")
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка очистки старых свечей для {symbol}: {e}")
+        finally:
+            cursor.close()
+
+    async def cleanup_old_candles_before_time(self, symbol: str, before_time_ms: int) -> int:
+        """Удалить свечи ДО указанного времени"""
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute("""
+                DELETE FROM kline_data 
+                WHERE symbol = %s AND timestamp_ms < %s
+            """, (symbol, before_time_ms))
+            
+            deleted_count = cursor.rowcount
+            return deleted_count
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка удаления старых свечей для {symbol}: {e}")
+            return 0
+        finally:
+            cursor.close()
+
+    async def cleanup_future_candles_after_time(self, symbol: str, after_time_ms: int) -> int:
+        """Удалить свечи ПОСЛЕ указанного времени"""
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute("""
+                DELETE FROM kline_data 
+                WHERE symbol = %s AND timestamp_ms >= %s
+            """, (symbol, after_time_ms))
+            
+            deleted_count = cursor.rowcount
+            return deleted_count
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка удаления будущих свечей для {symbol}: {e}")
+            return 0
+        finally:
+            cursor.close()
+
+    async def cleanup_old_data(self, hours: int):
+        """Общая очистка старых данных"""
+        cursor = self.connection.cursor()
+        try:
+            cutoff_time_ms = int((datetime.utcnow() - timedelta(hours=hours)).timestamp() * 1000)
+            
+            # Очищаем старые kline данные
+            cursor.execute("DELETE FROM kline_data WHERE timestamp_ms < %s", (cutoff_time_ms,))
+            kline_deleted = cursor.rowcount
+            
+            # Очищаем старые потоковые данные
+            cursor.execute("DELETE FROM streaming_data WHERE timestamp_ms < %s", (cutoff_time_ms,))
+            streaming_deleted = cursor.rowcount
+            
+            # Очищаем старые алерты (старше 7 дней)
+            week_ago_ms = int((datetime.utcnow() - timedelta(days=7)).timestamp() * 1000)
+            cursor.execute("DELETE FROM alerts WHERE alert_timestamp_ms < %s", (week_ago_ms,))
+            alerts_deleted = cursor.rowcount
+            
+            logger.info(f"🧹 Очистка: kline={kline_deleted}, streaming={streaming_deleted}, alerts={alerts_deleted}")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка общей очистки данных: {e}")
+        finally:
+            cursor.close()
+
+    # Методы для работы с объемами
+    async def get_historical_long_volumes(self, symbol: str, hours: int, 
+                                        offset_minutes: int = 0, volume_type: str = 'long') -> List[float]:
+        """Получить исторические объемы LONG свечей"""
+        cursor = self.connection.cursor()
+        try:
+            end_time_ms = int(datetime.utcnow().timestamp() * 1000) - (offset_minutes * 60 * 1000)
+            start_time_ms = end_time_ms - (hours * 60 * 60 * 1000)
+            
+            if volume_type == 'long':
+                cursor.execute("""
+                    SELECT volume * close_price as volume_usdt
+                    FROM kline_data 
+                    WHERE symbol = %s 
+                    AND timestamp_ms >= %s AND timestamp_ms < %s
+                    AND is_closed = TRUE AND is_long = TRUE
+                    ORDER BY timestamp_ms
+                """, (symbol, start_time_ms, end_time_ms))
+            else:
+                cursor.execute("""
+                    SELECT volume * close_price as volume_usdt
+                    FROM kline_data 
+                    WHERE symbol = %s 
+                    AND timestamp_ms >= %s AND timestamp_ms < %s
+                    AND is_closed = TRUE
+                    ORDER BY timestamp_ms
+                """, (symbol, start_time_ms, end_time_ms))
+            
+            return [float(row[0]) for row in cursor.fetchall()]
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения исторических объемов для {symbol}: {e}")
+            return []
+        finally:
+            cursor.close()
+
+    # Методы для работы с алертами
+    async def save_alert(self, alert_data: Dict) -> int:
+        """Сохранить алерт"""
+        cursor = self.connection.cursor()
+        try:
             cursor.execute("""
                 INSERT INTO alerts (
-                    symbol, alert_type, price, alert_timestamp_ms, close_timestamp_ms,
-                    volume_ratio, consecutive_count, current_volume_usdt, average_volume_usdt,
-                    is_closed, is_true_signal, has_imbalance, imbalance_data, 
-                    candle_data, order_book_snapshot, message
+                    symbol, alert_type, price, volume_ratio, current_volume_usdt,
+                    average_volume_usdt, consecutive_count, alert_timestamp_ms,
+                    close_timestamp_ms, is_closed, is_true_signal, has_imbalance,
+                    imbalance_data, candle_data, order_book_snapshot, message
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 alert_data['symbol'],
                 alert_data['alert_type'],
                 alert_data['price'],
-                alert_data['timestamp'],
-                alert_data.get('close_timestamp'),
                 alert_data.get('volume_ratio'),
-                alert_data.get('consecutive_count'),
                 alert_data.get('current_volume_usdt'),
                 alert_data.get('average_volume_usdt'),
+                alert_data.get('consecutive_count'),
+                alert_data['timestamp'],
+                alert_data.get('close_timestamp'),
                 alert_data.get('is_closed', False),
                 alert_data.get('is_true_signal'),
                 alert_data.get('has_imbalance', False),
@@ -678,257 +630,195 @@ class DatabaseManager:
                 json.dumps(alert_data.get('order_book_snapshot')) if alert_data.get('order_book_snapshot') else None,
                 alert_data.get('message')
             ))
-
+            
             alert_id = cursor.fetchone()[0]
-            cursor.close()
             return alert_id
-
+            
         except Exception as e:
-            logger.error(f"Ошибка сохранения алерта: {e}")
+            logger.error(f"❌ Ошибка сохранения алерта: {e}")
             return None
-
-    def _parse_json_field(self, field_value):
-        """Безопасное парсинг JSON поля"""
-        if field_value is None:
-            return None
-        
-        # Если это уже словарь/список Python, возвращаем как есть
-        if isinstance(field_value, (dict, list)):
-            return field_value
-        
-        # Если это строка, пытаемся распарсить JSON
-        if isinstance(field_value, str):
-            try:
-                return json.loads(field_value)
-            except (json.JSONDecodeError, ValueError):
-                logger.warning(f"Не удалось распарсить JSON: {field_value}")
-                return None
-        
-        return None
-
-    async def get_all_alerts(self, limit: int = 1000) -> Dict:
-        """Получение всех алертов"""
-        try:
-            cursor = self.connection.cursor(cursor_factory=RealDictCursor)
-
-            # Получаем алерты по объему
-            cursor.execute("""
-                SELECT * FROM alerts 
-                WHERE alert_type = 'volume_spike'
-                ORDER BY alert_timestamp_ms DESC 
-                LIMIT %s
-            """, (limit,))
-            volume_alerts = [dict(row) for row in cursor.fetchall()]
-
-            # Получаем алерты по последовательности
-            cursor.execute("""
-                SELECT * FROM alerts 
-                WHERE alert_type = 'consecutive_long'
-                ORDER BY alert_timestamp_ms DESC 
-                LIMIT %s
-            """, (limit,))
-            consecutive_alerts = [dict(row) for row in cursor.fetchall()]
-
-            # Получаем приоритетные алерты
-            cursor.execute("""
-                SELECT * FROM alerts 
-                WHERE alert_type = 'priority'
-                ORDER BY alert_timestamp_ms DESC 
-                LIMIT %s
-            """, (limit,))
-            priority_alerts = [dict(row) for row in cursor.fetchall()]
-
+        finally:
             cursor.close()
 
-            # Безопасно преобразуем JSON поля
-            for alerts_list in [volume_alerts, consecutive_alerts, priority_alerts]:
-                for alert in alerts_list:
-                    alert['imbalance_data'] = self._parse_json_field(alert.get('imbalance_data'))
-                    alert['candle_data'] = self._parse_json_field(alert.get('candle_data'))
-                    alert['order_book_snapshot'] = self._parse_json_field(alert.get('order_book_snapshot'))
-
+    async def get_all_alerts(self, limit: int = 100) -> Dict:
+        """Получить все алерты"""
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+        try:
+            cursor.execute("""
+                SELECT * FROM alerts 
+                ORDER BY alert_timestamp_ms DESC 
+                LIMIT %s
+            """, (limit,))
+            
+            all_alerts = [dict(row) for row in cursor.fetchall()]
+            
+            # Группируем по типам
+            volume_alerts = [a for a in all_alerts if a['alert_type'] == 'volume_spike']
+            consecutive_alerts = [a for a in all_alerts if a['alert_type'] == 'consecutive_long']
+            priority_alerts = [a for a in all_alerts if a['alert_type'] == 'priority']
+            
             return {
+                'alerts': all_alerts,
                 'volume_alerts': volume_alerts,
                 'consecutive_alerts': consecutive_alerts,
                 'priority_alerts': priority_alerts
             }
-
+            
         except Exception as e:
-            logger.error(f"Ошибка получения алертов: {e}")
-            return {
-                'volume_alerts': [],
-                'consecutive_alerts': [],
-                'priority_alerts': []
-            }
+            logger.error(f"❌ Ошибка получения алертов: {e}")
+            return {'alerts': [], 'volume_alerts': [], 'consecutive_alerts': [], 'priority_alerts': []}
+        finally:
+            cursor.close()
 
-    async def get_recent_volume_alerts(self, symbol: str, minutes_back: int) -> List[Dict]:
-        """Получение недавних алертов по объему для символа"""
+    async def get_alerts_by_type(self, alert_type: str, limit: int = 50) -> List[Dict]:
+        """Получить алерты по типу"""
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
         try:
-            cursor = self.connection.cursor(cursor_factory=RealDictCursor)
-
-            cutoff_time_ms = int((datetime.now(timezone.utc) - timedelta(minutes=minutes_back)).timestamp() * 1000)
-
             cursor.execute("""
                 SELECT * FROM alerts 
-                WHERE symbol = %s 
-                AND alert_type = 'volume_spike'
-                AND alert_timestamp_ms > %s
+                WHERE alert_type = %s
+                ORDER BY alert_timestamp_ms DESC 
+                LIMIT %s
+            """, (alert_type, limit))
+            
+            return [dict(row) for row in cursor.fetchall()]
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения алертов по типу {alert_type}: {e}")
+            return []
+        finally:
+            cursor.close()
+
+    async def clear_alerts(self, alert_type: str):
+        """Очистить алерты по типу"""
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute("DELETE FROM alerts WHERE alert_type = %s", (alert_type,))
+            deleted_count = cursor.rowcount
+            logger.info(f"🧹 Удалено {deleted_count} алертов типа {alert_type}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка очистки алертов типа {alert_type}: {e}")
+            raise
+        finally:
+            cursor.close()
+
+    async def get_recent_volume_alerts(self, symbol: str, minutes_back: int) -> List[Dict]:
+        """Получить недавние объемные алерты"""
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+        try:
+            cutoff_time_ms = int((datetime.utcnow() - timedelta(minutes=minutes_back)).timestamp() * 1000)
+            
+            cursor.execute("""
+                SELECT * FROM alerts 
+                WHERE symbol = %s AND alert_type = 'volume_spike'
+                AND alert_timestamp_ms >= %s
                 ORDER BY alert_timestamp_ms DESC
             """, (symbol, cutoff_time_ms))
-
-            rows = cursor.fetchall()
-            cursor.close()
-
-            alerts = []
-            for row in rows:
-                alert = dict(row)
-                alert['imbalance_data'] = self._parse_json_field(alert.get('imbalance_data'))
-                alert['candle_data'] = self._parse_json_field(alert.get('candle_data'))
-                alert['order_book_snapshot'] = self._parse_json_field(alert.get('order_book_snapshot'))
-                alerts.append(alert)
-
-            return alerts
-
+            
+            return [dict(row) for row in cursor.fetchall()]
+            
         except Exception as e:
-            logger.error(f"Ошибка получения недавних алертов по объему для {symbol}: {e}")
+            logger.error(f"❌ Ошибка получения недавних объемных алертов для {symbol}: {e}")
             return []
+        finally:
+            cursor.close()
 
     async def get_chart_data(self, symbol: str, hours: int = 1, alert_time: str = None) -> List[Dict]:
-        """Получение данных для графика"""
+        """Получить данные для графика"""
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
         try:
-            cursor = self.connection.cursor(cursor_factory=RealDictCursor)
-
-            # Определяем временные границы
             if alert_time:
-                try:
-                    center_time_ms = int(alert_time)
-                except:
-                    center_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                # Если указано время алерта, центрируем график вокруг него
+                alert_timestamp = datetime.fromisoformat(alert_time.replace('Z', '+00:00'))
+                center_time_ms = int(alert_timestamp.timestamp() * 1000)
+                start_time_ms = center_time_ms - (hours * 30 * 60 * 1000)  # 30 минут до
+                end_time_ms = center_time_ms + (hours * 30 * 60 * 1000)    # 30 минут после
             else:
-                center_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-            # Берем данные вокруг времени алерта
-            half_period_ms = (hours * 60 * 60 * 1000) // 2
-            start_time_ms = center_time_ms - half_period_ms
-            end_time_ms = center_time_ms + half_period_ms
-
+                # Обычный запрос за последние N часов
+                end_time_ms = int(datetime.utcnow().timestamp() * 1000)
+                start_time_ms = end_time_ms - (hours * 60 * 60 * 1000)
+            
             cursor.execute("""
-                SELECT 
-                    open_time_ms as timestamp,
-                    open_price as open,
-                    high_price as high,
-                    low_price as low,
-                    close_price as close,
-                    volume,
-                    volume_usdt,
-                    is_long
+                SELECT timestamp_ms as timestamp, open_price as open, high_price as high,
+                       low_price as low, close_price as close, volume
                 FROM kline_data 
-                WHERE symbol = %s 
-                AND open_time_ms >= %s 
-                AND open_time_ms <= %s
+                WHERE symbol = %s AND timestamp_ms >= %s AND timestamp_ms <= %s
                 AND is_closed = TRUE
-                ORDER BY open_time_ms
+                ORDER BY timestamp_ms
             """, (symbol, start_time_ms, end_time_ms))
-
-            rows = cursor.fetchall()
-            cursor.close()
-
+            
             chart_data = []
-            for row in rows:
+            for row in cursor.fetchall():
                 chart_data.append({
-                    'timestamp': int(row['timestamp']),
+                    'timestamp': row['timestamp'],
                     'open': float(row['open']),
                     'high': float(row['high']),
                     'low': float(row['low']),
                     'close': float(row['close']),
-                    'volume': float(row['volume']),
-                    'volume_usdt': float(row['volume_usdt']),
-                    'is_long': row['is_long']
+                    'volume': float(row['volume'])
                 })
-
+            
             return chart_data
-
+            
         except Exception as e:
-            logger.error(f"Ошибка получения данных графика для {symbol}: {e}")
+            logger.error(f"❌ Ошибка получения данных графика для {symbol}: {e}")
             return []
-
-    async def cleanup_old_data(self, retention_hours: int):
-        """Очистка старых данных"""
-        try:
-            cursor = self.connection.cursor()
-
-            # Очистка старых свечных данных
-            cutoff_time_ms = int((datetime.now(timezone.utc) - timedelta(hours=retention_hours)).timestamp() * 1000)
-
-            cursor.execute("DELETE FROM kline_data WHERE open_time_ms < %s", (cutoff_time_ms,))
-            deleted_candles = cursor.rowcount
-
-            # Очистка старых потоковых данных (старше 2 часов)
-            stream_cutoff_time_ms = int((datetime.now(timezone.utc) - timedelta(hours=2)).timestamp() * 1000)
-            cursor.execute("DELETE FROM streaming_kline_data WHERE open_time_ms < %s", (stream_cutoff_time_ms,))
-            deleted_stream = cursor.rowcount
-
-            # Очистка старых алертов (старше 7 дней)
-            alert_cutoff_ms = int((datetime.now(timezone.utc) - timedelta(days=7)).timestamp() * 1000)
-            cursor.execute("DELETE FROM alerts WHERE alert_timestamp_ms < %s", (alert_cutoff_ms,))
-            deleted_alerts = cursor.rowcount
-
+        finally:
             cursor.close()
-
-            logger.info(f"Очищено {deleted_candles} старых свечей, {deleted_stream} потоковых данных и {deleted_alerts} старых алертов")
-
-        except Exception as e:
-            logger.error(f"Ошибка очистки старых данных: {e}")
 
     # Методы для работы с избранным
     async def get_favorites(self) -> List[Dict]:
-        """Получение списка избранных пар"""
+        """Получить список избранных пар"""
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
         try:
-            cursor = self.connection.cursor(cursor_factory=RealDictCursor)
             cursor.execute("""
-                SELECT f.*, w.is_active, w.price_drop_percentage, w.current_price, w.historical_price,
-                       f.created_at as favorite_added_at
-                FROM favorites f
-                LEFT JOIN watchlist w ON f.symbol = w.symbol
-                ORDER BY f.sort_order, f.created_at
+                SELECT symbol, notes, color, sort_order, created_at, updated_at
+                FROM favorites 
+                ORDER BY sort_order, symbol
             """)
-            rows = cursor.fetchall()
-            cursor.close()
-            return [dict(row) for row in rows]
+            return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
-            logger.error(f"Ошибка получения избранного: {e}")
+            logger.error(f"❌ Ошибка получения избранного: {e}")
             return []
+        finally:
+            cursor.close()
 
     async def add_to_favorites(self, symbol: str, notes: str = None, color: str = '#FFD700'):
-        """Добавление в избранное"""
+        """Добавить пару в избранное"""
+        cursor = self.connection.cursor()
         try:
-            cursor = self.connection.cursor()
             cursor.execute("""
                 INSERT INTO favorites (symbol, notes, color)
                 VALUES (%s, %s, %s)
-                ON CONFLICT (symbol) DO NOTHING
+                ON CONFLICT (symbol) DO UPDATE SET
+                    notes = EXCLUDED.notes,
+                    color = EXCLUDED.color,
+                    updated_at = NOW()
             """, (symbol, notes, color))
-            cursor.close()
         except Exception as e:
-            logger.error(f"Ошибка добавления в избранное: {e}")
+            logger.error(f"❌ Ошибка добавления {symbol} в избранное: {e}")
+            raise
+        finally:
+            cursor.close()
 
     async def remove_from_favorites(self, symbol: str):
-        """Удаление из избранного"""
+        """Удалить пару из избранного"""
+        cursor = self.connection.cursor()
         try:
-            cursor = self.connection.cursor()
             cursor.execute("DELETE FROM favorites WHERE symbol = %s", (symbol,))
-            cursor.close()
         except Exception as e:
-            logger.error(f"Ошибка удаления из избранного: {e}")
+            logger.error(f"❌ Ошибка удаления {symbol} из избранного: {e}")
+            raise
+        finally:
+            cursor.close()
 
     async def update_favorite(self, symbol: str, notes: str = None, color: str = None, sort_order: int = None):
-        """Обновление избранной пары"""
+        """Обновить избранную пару"""
+        cursor = self.connection.cursor()
         try:
-            cursor = self.connection.cursor()
-
             updates = []
             params = []
-
+            
             if notes is not None:
                 updates.append("notes = %s")
                 params.append(notes)
@@ -938,115 +828,82 @@ class DatabaseManager:
             if sort_order is not None:
                 updates.append("sort_order = %s")
                 params.append(sort_order)
-
+            
             if updates:
                 updates.append("updated_at = NOW()")
                 params.append(symbol)
-
+                
                 query = f"UPDATE favorites SET {', '.join(updates)} WHERE symbol = %s"
                 cursor.execute(query, params)
-
-            cursor.close()
+                
         except Exception as e:
-            logger.error(f"Ошибка обновления избранного: {e}")
+            logger.error(f"❌ Ошибка обновления избранной пары {symbol}: {e}")
+            raise
+        finally:
+            cursor.close()
 
     async def reorder_favorites(self, symbol_order: List[str]):
-        """Изменение порядка избранных пар"""
+        """Изменить порядок избранных пар"""
+        cursor = self.connection.cursor()
         try:
-            cursor = self.connection.cursor()
-
-            for index, symbol in enumerate(symbol_order):
+            for i, symbol in enumerate(symbol_order):
                 cursor.execute("""
-                    UPDATE favorites 
-                    SET sort_order = %s, updated_at = NOW()
+                    UPDATE favorites SET sort_order = %s, updated_at = NOW()
                     WHERE symbol = %s
-                """, (index, symbol))
-
-            cursor.close()
+                """, (i, symbol))
         except Exception as e:
-            logger.error(f"Ошибка изменения порядка избранного: {e}")
+            logger.error(f"❌ Ошибка изменения порядка избранных пар: {e}")
+            raise
+        finally:
+            cursor.close()
 
-    # Методы для торговли
+    # Методы для торговых настроек
     async def get_trading_settings(self) -> Dict:
-        """Получение настроек торговли"""
+        """Получить настройки торговли"""
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
         try:
-            cursor = self.connection.cursor(cursor_factory=RealDictCursor)
-            cursor.execute("SELECT * FROM trading_settings ORDER BY id DESC LIMIT 1")
+            cursor.execute("SELECT * FROM trading_settings WHERE id = 1")
             row = cursor.fetchone()
-            cursor.close()
-
-            if row:
-                return dict(row)
-            else:
-                # Создаем настройки по умолчанию
-                await self.update_trading_settings({})
-                return await self.get_trading_settings()
-
+            return dict(row) if row else {}
         except Exception as e:
-            logger.error(f"Ошибка получения настроек торговли: {e}")
+            logger.error(f"❌ Ошибка получения настроек торговли: {e}")
             return {}
+        finally:
+            cursor.close()
 
     async def update_trading_settings(self, settings: Dict):
-        """Обновление настроек торговли"""
+        """Обновить настройки торговли"""
+        cursor = self.connection.cursor()
         try:
-            cursor = self.connection.cursor()
-
-            # Проверяем, есть ли уже настройки
-            cursor.execute("SELECT id FROM trading_settings LIMIT 1")
-            existing = cursor.fetchone()
-
-            if existing:
-                # Обновляем существующие настройки
-                updates = []
-                params = []
-
-                for key, value in settings.items():
-                    if key in ['account_balance', 'max_risk_per_trade', 'max_open_trades',
-                               'default_stop_loss_percentage', 'default_take_profit_percentage',
-                               'auto_calculate_quantity', 'api_key', 'api_secret', 'enable_real_trading',
-                               'default_leverage', 'default_margin_type', 'confirm_trades']:
-                        updates.append(f"{key} = %s")
-                        params.append(value)
-
-                if updates:
-                    updates.append("updated_at = NOW()")
-                    query = f"UPDATE trading_settings SET {', '.join(updates)} WHERE id = %s"
-                    params.append(existing[0])
-                    cursor.execute(query, params)
-            else:
-                # Создаем новые настройки
-                cursor.execute("""
-                    INSERT INTO trading_settings (
-                        account_balance, max_risk_per_trade, max_open_trades,
-                        default_stop_loss_percentage, default_take_profit_percentage,
-                        auto_calculate_quantity
-                    ) VALUES (%s, %s, %s, %s, %s, %s)
-                """, (
-                    settings.get('account_balance', 10000),
-                    settings.get('max_risk_per_trade', 2.0),
-                    settings.get('max_open_trades', 5),
-                    settings.get('default_stop_loss_percentage', 2.0),
-                    settings.get('default_take_profit_percentage', 6.0),
-                    settings.get('auto_calculate_quantity', True)
-                ))
-
-            cursor.close()
+            updates = []
+            params = []
+            
+            for key, value in settings.items():
+                updates.append(f"{key} = %s")
+                params.append(value)
+            
+            if updates:
+                updates.append("updated_at = NOW()")
+                query = f"UPDATE trading_settings SET {', '.join(updates)} WHERE id = 1"
+                cursor.execute(query, params)
+                
         except Exception as e:
-            logger.error(f"Ошибка обновления настроек торговли: {e}")
+            logger.error(f"❌ Ошибка обновления настроек торговли: {e}")
+            raise
+        finally:
+            cursor.close()
 
+    # Методы для бумажной торговли
     async def create_paper_trade(self, trade_data: Dict) -> int:
-        """Создание бумажной сделки"""
+        """Создать бумажную сделку"""
+        cursor = self.connection.cursor()
         try:
-            cursor = self.connection.cursor()
-
-            opened_at_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
             cursor.execute("""
                 INSERT INTO paper_trades (
                     symbol, trade_type, entry_price, quantity, stop_loss, take_profit,
                     risk_amount, risk_percentage, potential_profit, potential_loss,
-                    risk_reward_ratio, notes, alert_id, opened_at_ms
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    risk_reward_ratio, notes, alert_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 trade_data['symbol'],
@@ -1055,168 +912,136 @@ class DatabaseManager:
                 trade_data['quantity'],
                 trade_data.get('stop_loss'),
                 trade_data.get('take_profit'),
-                trade_data['risk_amount'],
-                trade_data['risk_percentage'],
+                trade_data.get('risk_amount'),
+                trade_data.get('risk_percentage'),
                 trade_data.get('potential_profit'),
                 trade_data.get('potential_loss'),
                 trade_data.get('risk_reward_ratio'),
                 trade_data.get('notes'),
-                trade_data.get('alert_id'),
-                opened_at_ms
+                trade_data.get('alert_id')
             ))
-
-            trade_id = cursor.fetchone()[0]
-            cursor.close()
-            return trade_id
-
+            
+            return cursor.fetchone()[0]
+            
         except Exception as e:
-            logger.error(f"Ошибка создания бумажной сделки: {e}")
+            logger.error(f"❌ Ошибка создания бумажной сделки: {e}")
             return None
+        finally:
+            cursor.close()
 
     async def get_paper_trades(self, status: str = None, limit: int = 100) -> List[Dict]:
-        """Получение бумажных сделок"""
+        """Получить бумажные сделки"""
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
         try:
-            cursor = self.connection.cursor(cursor_factory=RealDictCursor)
-
             if status:
                 cursor.execute("""
                     SELECT * FROM paper_trades 
                     WHERE status = %s
-                    ORDER BY opened_at_ms DESC 
+                    ORDER BY entry_time DESC 
                     LIMIT %s
                 """, (status, limit))
             else:
                 cursor.execute("""
                     SELECT * FROM paper_trades 
-                    ORDER BY opened_at_ms DESC 
+                    ORDER BY entry_time DESC 
                     LIMIT %s
                 """, (limit,))
-
-            rows = cursor.fetchall()
-            cursor.close()
-            return [dict(row) for row in rows]
-
+            
+            return [dict(row) for row in cursor.fetchall()]
+            
         except Exception as e:
-            logger.error(f"Ошибка получения бумажных сделок: {e}")
+            logger.error(f"❌ Ошибка получения бумажных сделок: {e}")
             return []
+        finally:
+            cursor.close()
 
     async def close_paper_trade(self, trade_id: int, exit_price: float, exit_reason: str = 'MANUAL') -> bool:
-        """Закрытие бумажной сделки"""
+        """Закрыть бумажную сделку"""
+        cursor = self.connection.cursor()
         try:
-            cursor = self.connection.cursor(cursor_factory=RealDictCursor)
-
             # Получаем данные сделки
-            cursor.execute("SELECT * FROM paper_trades WHERE id = %s AND status = 'OPEN'", (trade_id,))
+            cursor.execute("""
+                SELECT trade_type, entry_price, quantity 
+                FROM paper_trades 
+                WHERE id = %s AND status = 'OPEN'
+            """, (trade_id,))
+            
             trade = cursor.fetchone()
-
             if not trade:
                 return False
-
-            # Рассчитываем P&L
-            entry_price = float(trade['entry_price'])
-            quantity = float(trade['quantity'])
-            trade_type = trade['trade_type']
-
+            
+            trade_type, entry_price, quantity = trade
+            
+            # Рассчитываем прибыль/убыток
             if trade_type == 'LONG':
-                pnl = (exit_price - entry_price) * quantity
+                profit_loss = (exit_price - entry_price) * quantity
             else:  # SHORT
-                pnl = (entry_price - exit_price) * quantity
-
-            position_value = entry_price * quantity
-            pnl_percentage = (pnl / position_value) * 100 if position_value > 0 else 0
-
-            closed_at_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
+                profit_loss = (entry_price - exit_price) * quantity
+            
             # Обновляем сделку
             cursor.execute("""
                 UPDATE paper_trades 
-                SET status = 'CLOSED', exit_price = %s, exit_reason = %s, 
-                    pnl = %s, pnl_percentage = %s, closed_at_ms = %s, updated_at = NOW()
+                SET exit_price = %s, exit_reason = %s, actual_profit_loss = %s,
+                    status = 'CLOSED', exit_time = NOW()
                 WHERE id = %s
-            """, (exit_price, exit_reason, pnl, pnl_percentage, closed_at_ms, trade_id))
-
-            cursor.close()
-            return True
-
+            """, (exit_price, exit_reason, profit_loss, trade_id))
+            
+            return cursor.rowcount > 0
+            
         except Exception as e:
-            logger.error(f"Ошибка закрытия бумажной сделки: {e}")
+            logger.error(f"❌ Ошибка закрытия бумажной сделки {trade_id}: {e}")
             return False
+        finally:
+            cursor.close()
 
     async def get_trading_statistics(self) -> Dict:
-        """Получение статистики торговли"""
+        """Получить статистику торговли"""
+        cursor = self.connection.cursor()
         try:
-            cursor = self.connection.cursor(cursor_factory=RealDictCursor)
-
             # Общая статистика
             cursor.execute("""
                 SELECT 
                     COUNT(*) as total_trades,
-                    COUNT(CASE WHEN status = 'OPEN' THEN 1 END) as open_trades,
-                    COUNT(CASE WHEN status = 'CLOSED' THEN 1 END) as closed_trades,
-                    COUNT(CASE WHEN status = 'CLOSED' AND pnl > 0 THEN 1 END) as winning_trades,
-                    COUNT(CASE WHEN status = 'CLOSED' AND pnl < 0 THEN 1 END) as losing_trades,
-                    COALESCE(SUM(CASE WHEN status = 'CLOSED' THEN pnl END), 0) as total_pnl,
-                    COALESCE(AVG(CASE WHEN status = 'CLOSED' THEN pnl_percentage END), 0) as avg_pnl_percentage,
-                    COALESCE(MAX(CASE WHEN status = 'CLOSED' THEN pnl END), 0) as max_profit,
-                    COALESCE(MIN(CASE WHEN status = 'CLOSED' THEN pnl END), 0) as max_loss
+                    COUNT(*) FILTER (WHERE status = 'OPEN') as open_trades,
+                    COUNT(*) FILTER (WHERE status = 'CLOSED') as closed_trades,
+                    COUNT(*) FILTER (WHERE status = 'CLOSED' AND actual_profit_loss > 0) as winning_trades,
+                    COUNT(*) FILTER (WHERE status = 'CLOSED' AND actual_profit_loss < 0) as losing_trades,
+                    COALESCE(SUM(actual_profit_loss) FILTER (WHERE status = 'CLOSED'), 0) as total_pnl,
+                    COALESCE(AVG(actual_profit_loss) FILTER (WHERE status = 'CLOSED'), 0) as avg_pnl,
+                    COALESCE(MAX(actual_profit_loss) FILTER (WHERE status = 'CLOSED'), 0) as max_profit,
+                    COALESCE(MIN(actual_profit_loss) FILTER (WHERE status = 'CLOSED'), 0) as max_loss
                 FROM paper_trades
             """)
-
-            stats = dict(cursor.fetchone())
-            cursor.close()
-
-            # Рассчитываем винрейт
-            closed_trades = stats['closed_trades']
-            winning_trades = stats['winning_trades']
-            stats['win_rate'] = (winning_trades / closed_trades * 100) if closed_trades > 0 else 0
-
-            return stats
-
+            
+            stats = cursor.fetchone()
+            
+            total_trades, open_trades, closed_trades, winning_trades, losing_trades, \
+            total_pnl, avg_pnl, max_profit, max_loss = stats
+            
+            # Рассчитываем дополнительные метрики
+            win_rate = (winning_trades / closed_trades * 100) if closed_trades > 0 else 0
+            
+            return {
+                'total_trades': total_trades,
+                'open_trades': open_trades,
+                'closed_trades': closed_trades,
+                'winning_trades': winning_trades,
+                'losing_trades': losing_trades,
+                'win_rate': round(win_rate, 2),
+                'total_pnl': float(total_pnl),
+                'avg_pnl': float(avg_pnl),
+                'max_profit': float(max_profit),
+                'max_loss': float(max_loss)
+            }
+            
         except Exception as e:
-            logger.error(f"Ошибка получения статистики торговли: {e}")
+            logger.error(f"❌ Ошибка получения статистики торговли: {e}")
             return {}
-
-    async def get_alerts_by_type(self, alert_type: str, limit: int = 50) -> List[Dict]:
-        """Получение алертов по типу"""
-        try:
-            cursor = self.connection.cursor(cursor_factory=RealDictCursor)
-            cursor.execute("""
-                SELECT * FROM alerts 
-                WHERE alert_type = %s
-                ORDER BY alert_timestamp_ms DESC 
-                LIMIT %s
-            """, (alert_type, limit))
-            rows = cursor.fetchall()
+        finally:
             cursor.close()
-
-            alerts = []
-            for row in rows:
-                alert = dict(row)
-                # Безопасно преобразуем JSON поля
-                alert['imbalance_data'] = self._parse_json_field(alert.get('imbalance_data'))
-                alert['candle_data'] = self._parse_json_field(alert.get('candle_data'))
-                alert['order_book_snapshot'] = self._parse_json_field(alert.get('order_book_snapshot'))
-                alerts.append(alert)
-
-            return alerts
-
-        except Exception as e:
-            logger.error(f"Ошибка получения алертов по типу {alert_type}: {e}")
-            return []
-
-    async def clear_alerts(self, alert_type: str):
-        """Очистка алертов по типу"""
-        try:
-            cursor = self.connection.cursor()
-            cursor.execute("DELETE FROM alerts WHERE alert_type = %s", (alert_type,))
-            deleted_count = cursor.rowcount
-            cursor.close()
-            logger.info(f"Удалено {deleted_count} алертов типа {alert_type}")
-        except Exception as e:
-            logger.error(f"Ошибка очистки алертов типа {alert_type}: {e}")
 
     def close(self):
-        """Закрытие соединения с базой данных"""
+        """Закрыть соединение с базой данных"""
         if self.connection:
             self.connection.close()
-            logger.info("Соединение с базой данных закрыто")
+            logger.info("🔌 Соединение с базой данных закрыто")
