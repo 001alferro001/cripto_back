@@ -38,6 +38,8 @@ class DatabaseManager:
         """Выполнение миграций базы данных"""
         cursor = self.connection.cursor()
         try:
+            logger.info("🔄 Проверка и выполнение миграций базы данных...")
+            
             # Проверяем и добавляем недостающие колонки в watchlist
             cursor.execute("""
                 SELECT column_name 
@@ -69,14 +71,15 @@ class DatabaseManager:
             # Обновляем существующие записи, у которых нет времени
             cursor.execute("""
                 UPDATE watchlist 
-                SET added_at = NOW(), updated_at = NOW() 
+                SET added_at = COALESCE(added_at, NOW()), 
+                    updated_at = COALESCE(updated_at, NOW()) 
                 WHERE added_at IS NULL OR updated_at IS NULL
             """)
 
-            logger.info("✅ Миграции базы данных выполнены")
+            logger.info("✅ Миграции базы данных выполнены успешно")
 
         except Exception as e:
-            logger.error(f"❌ Ошибка выполнения миграций: {e}")
+            logger.error(f"❌ Ошибка выполнения миграций: {type(e).__name__}: {str(e)}")
             raise
         finally:
             cursor.close()
@@ -231,7 +234,7 @@ class DatabaseManager:
             logger.info("✅ Таблицы созданы успешно")
 
         except Exception as e:
-            logger.error(f"❌ Ошибка создания таблиц: {e}")
+            logger.error(f"❌ Ошибка создания таблиц: {type(e).__name__}: {str(e)}")
             raise
         finally:
             cursor.close()
@@ -244,7 +247,7 @@ class DatabaseManager:
             cursor.execute("SELECT symbol FROM watchlist WHERE is_active = TRUE ORDER BY symbol")
             return [row[0] for row in cursor.fetchall()]
         except Exception as e:
-            logger.error(f"❌ Ошибка получения watchlist: {e}")
+            logger.error(f"❌ Ошибка получения watchlist: {type(e).__name__}: {str(e)}")
             return []
         finally:
             cursor.close()
@@ -253,30 +256,72 @@ class DatabaseManager:
         """Получить детальную информацию о торговых парах"""
         cursor = self.connection.cursor(cursor_factory=RealDictCursor)
         try:
+            logger.debug("🔍 Получение деталей watchlist...")
+            
+            # Сначала проверяем существование таблицы
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'watchlist'
+                )
+            """)
+            
+            table_exists = cursor.fetchone()[0]
+            if not table_exists:
+                logger.warning("⚠️ Таблица watchlist не существует")
+                return []
+            
             # Проверяем существование колонок перед запросом
             cursor.execute("""
                 SELECT column_name 
                 FROM information_schema.columns 
                 WHERE table_name = 'watchlist'
+                ORDER BY column_name
             """)
             columns = [row[0] for row in cursor.fetchall()]
+            logger.debug(f"🔍 Найденные колонки в watchlist: {columns}")
+            
+            if not columns:
+                logger.warning("⚠️ Не найдено колонок в таблице watchlist")
+                return []
             
             # Формируем запрос только с существующими колонками
-            base_columns = "id, symbol, is_active, price_drop_percentage, current_price, historical_price"
+            required_columns = ["id", "symbol", "is_active"]
+            optional_columns = ["price_drop_percentage", "current_price", "historical_price", "added_at", "updated_at"]
             
-            if 'added_at' in columns:
-                base_columns += ", added_at"
-            if 'updated_at' in columns:
-                base_columns += ", updated_at"
+            # Проверяем наличие обязательных колонок
+            missing_required = [col for col in required_columns if col not in columns]
+            if missing_required:
+                logger.error(f"❌ Отсутствуют обязательные колонки: {missing_required}")
+                return []
+            
+            # Собираем все доступные колонки
+            available_columns = required_columns.copy()
+            for col in optional_columns:
+                if col in columns:
+                    available_columns.append(col)
+            
+            query_columns = ", ".join(available_columns)
+            logger.debug(f"🔍 Запрос с колонками: {query_columns}")
             
             cursor.execute(f"""
-                SELECT {base_columns}
+                SELECT {query_columns}
                 FROM watchlist 
                 ORDER BY symbol
             """)
-            return [dict(row) for row in cursor.fetchall()]
+            
+            results = cursor.fetchall()
+            logger.debug(f"🔍 Получено {len(results)} записей из watchlist")
+            
+            return [dict(row) for row in results]
+            
+        except psycopg2.Error as e:
+            logger.error(f"❌ Ошибка PostgreSQL при получении деталей watchlist: {e.pgcode} - {e.pgerror}")
+            return []
         except Exception as e:
-            logger.error(f"❌ Ошибка получения деталей watchlist: {e}")
+            logger.error(f"❌ Ошибка получения деталей watchlist: {type(e).__name__}: {str(e)}")
+            import traceback
+            logger.error(f"❌ Полная трассировка: {traceback.format_exc()}")
             return []
         finally:
             cursor.close()
@@ -298,7 +343,7 @@ class DatabaseManager:
             """, (symbol, price_drop, current_price, historical_price))
             logger.info(f"✅ Добавлена пара {symbol} в watchlist")
         except Exception as e:
-            logger.error(f"❌ Ошибка добавления {symbol} в watchlist: {e}")
+            logger.error(f"❌ Ошибка добавления {symbol} в watchlist: {type(e).__name__}: {str(e)}")
             raise
         finally:
             cursor.close()
@@ -313,7 +358,7 @@ class DatabaseManager:
                 cursor.execute("DELETE FROM watchlist WHERE symbol = %s", (symbol,))
             logger.info(f"✅ Удалена пара из watchlist")
         except Exception as e:
-            logger.error(f"❌ Ошибка удаления из watchlist: {e}")
+            logger.error(f"❌ Ошибка удаления из watchlist: {type(e).__name__}: {str(e)}")
             raise
         finally:
             cursor.close()
@@ -328,7 +373,7 @@ class DatabaseManager:
                 WHERE id = %s
             """, (symbol, is_active, item_id))
         except Exception as e:
-            logger.error(f"❌ Ошибка обновления watchlist: {e}")
+            logger.error(f"❌ Ошибка обновления watchlist: {type(e).__name__}: {str(e)}")
             raise
         finally:
             cursor.close()
@@ -378,7 +423,7 @@ class DatabaseManager:
                 """, (symbol, timestamp_ms, open_price, high_price, low_price, close_price, volume))
 
         except Exception as e:
-            logger.error(f"❌ Ошибка сохранения kline данных для {symbol}: {e}")
+            logger.error(f"❌ Ошибка сохранения kline данных для {symbol}: {type(e).__name__}: {str(e)}")
             raise
         finally:
             cursor.close()
@@ -397,7 +442,7 @@ class DatabaseManager:
             """, (symbol, timestamp_ms))
             return cursor.fetchone() is not None
         except Exception as e:
-            logger.error(f"❌ Ошибка проверки существования свечи: {e}")
+            logger.error(f"❌ Ошибка проверки существования свечи: {type(e).__name__}: {str(e)}")
             return False
         finally:
             cursor.close()
@@ -432,7 +477,7 @@ class DatabaseManager:
             return list(reversed(candles))
             
         except Exception as e:
-            logger.error(f"❌ Ошибка получения последних свечей для {symbol}: {e}")
+            logger.error(f"❌ Ошибка получения последних свечей для {symbol}: {type(e).__name__}: {str(e)}")
             return []
         finally:
             cursor.close()
@@ -459,7 +504,7 @@ class DatabaseManager:
             
             return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
-            logger.error(f"❌ Ошибка получения потоковых данных: {e}")
+            logger.error(f"❌ Ошибка получения потоковых данных: {type(e).__name__}: {str(e)}")
             return []
         finally:
             cursor.close()
@@ -496,7 +541,7 @@ class DatabaseManager:
             }
             
         except Exception as e:
-            logger.error(f"❌ Ошибка проверки целостности данных для {symbol}: {e}")
+            logger.error(f"❌ Ошибка проверки целостности данных для {symbol}: {type(e).__name__}: {str(e)}")
             return {
                 'total_expected': 0,
                 'total_existing': 0,
@@ -534,7 +579,7 @@ class DatabaseManager:
             }
             
         except Exception as e:
-            logger.error(f"❌ Ошибка проверки целостности данных в диапазоне для {symbol}: {e}")
+            logger.error(f"❌ Ошибка проверки целостности данных в диапазоне для {symbol}: {type(e).__name__}: {str(e)}")
             return {
                 'total_expected': 0,
                 'total_existing': 0,
@@ -560,7 +605,7 @@ class DatabaseManager:
                 logger.debug(f"🧹 Удалено {deleted_count} старых свечей для {symbol}")
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка очистки старых свечей для {symbol}: {e}")
+            logger.error(f"❌ Ошибка очистки старых свечей для {symbol}: {type(e).__name__}: {str(e)}")
         finally:
             cursor.close()
 
@@ -577,7 +622,7 @@ class DatabaseManager:
             return deleted_count
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка удаления старых свечей для {symbol}: {e}")
+            logger.error(f"❌ Ошибка удаления старых свечей для {symbol}: {type(e).__name__}: {str(e)}")
             return 0
         finally:
             cursor.close()
@@ -595,7 +640,7 @@ class DatabaseManager:
             return deleted_count
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка удаления будущих свечей для {symbol}: {e}")
+            logger.error(f"❌ Ошибка удаления будущих свечей для {symbol}: {type(e).__name__}: {str(e)}")
             return 0
         finally:
             cursor.close()
@@ -622,7 +667,7 @@ class DatabaseManager:
             logger.info(f"🧹 Очистка: kline={kline_deleted}, streaming={streaming_deleted}, alerts={alerts_deleted}")
             
         except Exception as e:
-            logger.error(f"❌ Ошибка общей очистки данных: {e}")
+            logger.error(f"❌ Ошибка общей очистки данных: {type(e).__name__}: {str(e)}")
         finally:
             cursor.close()
 
@@ -657,7 +702,7 @@ class DatabaseManager:
             return [float(row[0]) for row in cursor.fetchall()]
             
         except Exception as e:
-            logger.error(f"❌ Ошибка получения исторических объемов для {symbol}: {e}")
+            logger.error(f"❌ Ошибка получения исторических объемов для {symbol}: {type(e).__name__}: {str(e)}")
             return []
         finally:
             cursor.close()
@@ -698,7 +743,7 @@ class DatabaseManager:
             return alert_id
             
         except Exception as e:
-            logger.error(f"❌ Ошибка сохранения алерта: {e}")
+            logger.error(f"❌ Ошибка сохранения алерта: {type(e).__name__}: {str(e)}")
             return None
         finally:
             cursor.close()
@@ -728,7 +773,7 @@ class DatabaseManager:
             }
             
         except Exception as e:
-            logger.error(f"❌ Ошибка получения алертов: {e}")
+            logger.error(f"❌ Ошибка получения алертов: {type(e).__name__}: {str(e)}")
             return {'alerts': [], 'volume_alerts': [], 'consecutive_alerts': [], 'priority_alerts': []}
         finally:
             cursor.close()
@@ -747,7 +792,7 @@ class DatabaseManager:
             return [dict(row) for row in cursor.fetchall()]
             
         except Exception as e:
-            logger.error(f"❌ Ошибка получения алертов по типу {alert_type}: {e}")
+            logger.error(f"❌ Ошибка получения алертов по типу {alert_type}: {type(e).__name__}: {str(e)}")
             return []
         finally:
             cursor.close()
@@ -760,7 +805,7 @@ class DatabaseManager:
             deleted_count = cursor.rowcount
             logger.info(f"🧹 Удалено {deleted_count} алертов типа {alert_type}")
         except Exception as e:
-            logger.error(f"❌ Ошибка очистки алертов типа {alert_type}: {e}")
+            logger.error(f"❌ Ошибка очистки алертов типа {alert_type}: {type(e).__name__}: {str(e)}")
             raise
         finally:
             cursor.close()
@@ -781,7 +826,7 @@ class DatabaseManager:
             return [dict(row) for row in cursor.fetchall()]
             
         except Exception as e:
-            logger.error(f"❌ Ошибка получения недавних объемных алертов для {symbol}: {e}")
+            logger.error(f"❌ Ошибка получения недавних объемных алертов для {symbol}: {type(e).__name__}: {str(e)}")
             return []
         finally:
             cursor.close()
@@ -824,7 +869,7 @@ class DatabaseManager:
             return chart_data
             
         except Exception as e:
-            logger.error(f"❌ Ошибка получения данных графика для {symbol}: {e}")
+            logger.error(f"❌ Ошибка получения данных графика для {symbol}: {type(e).__name__}: {str(e)}")
             return []
         finally:
             cursor.close()
@@ -841,7 +886,7 @@ class DatabaseManager:
             """)
             return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
-            logger.error(f"❌ Ошибка получения избранного: {e}")
+            logger.error(f"❌ Ошибка получения избранного: {type(e).__name__}: {str(e)}")
             return []
         finally:
             cursor.close()
@@ -859,7 +904,7 @@ class DatabaseManager:
                     updated_at = NOW()
             """, (symbol, notes, color))
         except Exception as e:
-            logger.error(f"❌ Ошибка добавления {symbol} в избранное: {e}")
+            logger.error(f"❌ Ошибка добавления {symbol} в избранное: {type(e).__name__}: {str(e)}")
             raise
         finally:
             cursor.close()
@@ -870,7 +915,7 @@ class DatabaseManager:
         try:
             cursor.execute("DELETE FROM favorites WHERE symbol = %s", (symbol,))
         except Exception as e:
-            logger.error(f"❌ Ошибка удаления {symbol} из избранного: {e}")
+            logger.error(f"❌ Ошибка удаления {symbol} из избранного: {type(e).__name__}: {str(e)}")
             raise
         finally:
             cursor.close()
@@ -900,7 +945,7 @@ class DatabaseManager:
                 cursor.execute(query, params)
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка обновления избранной пары {symbol}: {e}")
+            logger.error(f"❌ Ошибка обновления избранной пары {symbol}: {type(e).__name__}: {str(e)}")
             raise
         finally:
             cursor.close()
@@ -915,7 +960,7 @@ class DatabaseManager:
                     WHERE symbol = %s
                 """, (i, symbol))
         except Exception as e:
-            logger.error(f"❌ Ошибка изменения порядка избранных пар: {e}")
+            logger.error(f"❌ Ошибка изменения порядка избранных пар: {type(e).__name__}: {str(e)}")
             raise
         finally:
             cursor.close()
@@ -929,7 +974,7 @@ class DatabaseManager:
             row = cursor.fetchone()
             return dict(row) if row else {}
         except Exception as e:
-            logger.error(f"❌ Ошибка получения настроек торговли: {e}")
+            logger.error(f"❌ Ошибка получения настроек торговли: {type(e).__name__}: {str(e)}")
             return {}
         finally:
             cursor.close()
@@ -951,7 +996,7 @@ class DatabaseManager:
                 cursor.execute(query, params)
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка обновления настроек торговли: {e}")
+            logger.error(f"❌ Ошибка обновления настроек торговли: {type(e).__name__}: {str(e)}")
             raise
         finally:
             cursor.close()
@@ -987,7 +1032,7 @@ class DatabaseManager:
             return cursor.fetchone()[0]
             
         except Exception as e:
-            logger.error(f"❌ Ошибка создания бумажной сделки: {e}")
+            logger.error(f"❌ Ошибка создания бумажной сделки: {type(e).__name__}: {str(e)}")
             return None
         finally:
             cursor.close()
@@ -1013,7 +1058,7 @@ class DatabaseManager:
             return [dict(row) for row in cursor.fetchall()]
             
         except Exception as e:
-            logger.error(f"❌ Ошибка получения бумажных сделок: {e}")
+            logger.error(f"❌ Ошибка получения бумажных сделок: {type(e).__name__}: {str(e)}")
             return []
         finally:
             cursor.close()
@@ -1052,7 +1097,7 @@ class DatabaseManager:
             return cursor.rowcount > 0
             
         except Exception as e:
-            logger.error(f"❌ Ошибка закрытия бумажной сделки {trade_id}: {e}")
+            logger.error(f"❌ Ошибка закрытия бумажной сделки {trade_id}: {type(e).__name__}: {str(e)}")
             return False
         finally:
             cursor.close()
@@ -1098,7 +1143,7 @@ class DatabaseManager:
             }
             
         except Exception as e:
-            logger.error(f"❌ Ошибка получения статистики торговли: {e}")
+            logger.error(f"❌ Ошибка получения статистики торговли: {type(e).__name__}: {str(e)}")
             return {}
         finally:
             cursor.close()
