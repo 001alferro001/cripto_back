@@ -70,6 +70,16 @@ class BybitWebSocketClient:
         self.last_stream_data = {}  # symbol -> timestamp последних данных
         self.stream_timeout_seconds = 120  # Таймаут для потоковых данных
         self.stream_monitor_task = None
+        
+        # Новые настройки для решения проблем с потоковыми данными
+        self.inactive_pairs_threshold = 0.3  # 30% неактивных пар для переподключения
+        self.force_reconnect_timeout = 300  # 5 минут без данных для принудительного переподключения
+        self.subscription_retry_task = None
+        self.failed_subscriptions = set()  # Пары с неудачными подписками
+        self.subscription_retry_interval = 60  # Повторная попытка подписки каждую минуту
+        
+        # Детальная статистика по парам
+        self.pair_statistics = {}  # symbol -> {'messages': count, 'last_message': timestamp, 'errors': count}
 
     async def start(self):
         """Запуск WebSocket соединения с правильной очередностью"""
@@ -112,6 +122,15 @@ class BybitWebSocketClient:
 
             if len(self.trading_pairs) == 0:
                 logger.warning("⚠️ Список торговых пар пуст. Система будет ожидать добавления пар.")
+
+            # Инициализируем статистику для всех пар
+            for symbol in self.trading_pairs:
+                self.pair_statistics[symbol] = {
+                    'messages': 0,
+                    'last_message': None,
+                    'errors': 0,
+                    'subscription_attempts': 0
+                }
 
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки торговых пар: {e}")
@@ -431,6 +450,8 @@ class BybitWebSocketClient:
             self.initial_subscription_complete = True
         else:
             logger.warning(f"⚠️ Подписка частично завершена: {len(self.subscribed_pairs)}/{len(self.trading_pairs)} пар")
+            # Добавляем неподписанные пары в список неудачных
+            self.failed_subscriptions = self.trading_pairs - self.subscribed_pairs
 
     async def _websocket_connection_loop(self):
         """Основной цикл WebSocket соединения с улучшенной обработкой переподключений"""
@@ -478,6 +499,7 @@ class BybitWebSocketClient:
                 # Сбрасываем отслеживание подписок
                 self.subscribed_pairs.clear()
                 self.subscription_pending.clear()
+                self.failed_subscriptions.clear()
 
                 # Подписываемся на kline данные для ВСЕХ торговых пар
                 if self.trading_pairs:
@@ -569,6 +591,11 @@ class BybitWebSocketClient:
 
                 # Добавляем в ожидающие подписки
                 self.subscription_pending.update(batch)
+                
+                # Обновляем статистику попыток подписки
+                for symbol in batch:
+                    if symbol in self.pair_statistics:
+                        self.pair_statistics[symbol]['subscription_attempts'] += 1
 
                 # Небольшая задержка между пакетами
                 if i + batch_size < len(pairs_list):
@@ -576,7 +603,8 @@ class BybitWebSocketClient:
                     
             except Exception as e:
                 logger.error(f"❌ Ошибка подписки на пакет {i // batch_size + 1}: {e}")
-                # Продолжаем с следующим пакетом
+                # Добавляем пары в список неудачных подписок
+                self.failed_subscriptions.update(batch)
                 continue
 
     async def _start_periodic_tasks(self):
@@ -589,6 +617,9 @@ class BybitWebSocketClient:
 
         # Задача очистки данных
         asyncio.create_task(self._data_cleanup_task())
+        
+        # Задача повторных попыток подписки
+        self.subscription_retry_task = asyncio.create_task(self._subscription_retry_manager())
 
     async def _start_stream_monitoring(self):
         """Запуск мониторинга потоковых данных"""
@@ -596,7 +627,7 @@ class BybitWebSocketClient:
         logger.info("📡 Мониторинг потоковых данных запущен")
 
     async def _stream_monitor(self):
-        """Мониторинг активности потоковых данных"""
+        """Улучшенный мониторинг активности потоковых данных"""
         while self.is_running:
             try:
                 await asyncio.sleep(30)  # Проверяем каждые 30 секунд
@@ -606,6 +637,7 @@ class BybitWebSocketClient:
 
                 current_time = datetime.utcnow()
                 inactive_pairs = []
+                critical_pairs = []  # Пары без данных более 5 минут
 
                 # Проверяем активность потоковых данных для каждой пары
                 for symbol in self.trading_pairs:
@@ -614,32 +646,90 @@ class BybitWebSocketClient:
                     if last_data_time:
                         time_since_last = (current_time - last_data_time).total_seconds()
                         
-                        if time_since_last > self.stream_timeout_seconds:
+                        if time_since_last > self.force_reconnect_timeout:  # 5 минут
+                            critical_pairs.append(symbol)
+                            logger.error(f"🚨 КРИТИЧНО: Нет потоковых данных для {symbol} уже {time_since_last:.0f} секунд")
+                        elif time_since_last > self.stream_timeout_seconds:  # 2 минуты
                             inactive_pairs.append(symbol)
                             logger.warning(f"⚠️ Нет потоковых данных для {symbol} уже {time_since_last:.0f} секунд")
+                    else:
+                        # Пара никогда не получала данные
+                        critical_pairs.append(symbol)
+                        logger.error(f"🚨 КРИТИЧНО: Пара {symbol} никогда не получала потоковые данные")
 
-                # Отправляем статистику потоковых данных
+                # Отправляем детальную статистику потоковых данных
                 streaming_stats = {
                     "type": "streaming_status",
                     "active_pairs": len(self.trading_pairs) - len(inactive_pairs),
                     "inactive_pairs": len(inactive_pairs),
+                    "critical_pairs": len(critical_pairs),
                     "total_pairs": len(self.trading_pairs),
                     "websocket_connected": self.websocket_connected,
                     "streaming_active": self.streaming_active,
                     "messages_received": self.messages_received,
+                    "subscribed_pairs": len(self.subscribed_pairs),
+                    "failed_subscriptions": len(self.failed_subscriptions),
+                    "inactive_pair_list": inactive_pairs[:10],  # Первые 10 неактивных пар
+                    "critical_pair_list": critical_pairs[:10],  # Первые 10 критичных пар
                     "timestamp": current_time.isoformat()
                 }
 
                 await self.connection_manager.broadcast_json(streaming_stats)
 
-                # Если слишком много неактивных пар, пытаемся переподключиться
-                if len(inactive_pairs) > len(self.trading_pairs) * 0.5:  # Более 50% пар неактивны
-                    logger.error(f"❌ Слишком много неактивных пар ({len(inactive_pairs)}/{len(self.trading_pairs)}). Переподключение...")
+                # Принимаем решение о переподключении
+                inactive_ratio = len(inactive_pairs) / len(self.trading_pairs) if self.trading_pairs else 0
+                
+                # Если есть критичные пары или слишком много неактивных - переподключаемся
+                if critical_pairs or inactive_ratio > self.inactive_pairs_threshold:
+                    logger.error(f"❌ Критическая ситуация с потоковыми данными:")
+                    logger.error(f"   - Критичных пар: {len(critical_pairs)}")
+                    logger.error(f"   - Неактивных пар: {len(inactive_pairs)}/{len(self.trading_pairs)} ({inactive_ratio:.1%})")
+                    logger.error(f"   - Инициируем переподключение...")
+                    
+                    # Принудительно закрываем WebSocket для переподключения
                     if self.websocket:
-                        await self.websocket.close()
+                        try:
+                            await self.websocket.close()
+                        except:
+                            pass
 
             except Exception as e:
                 logger.error(f"❌ Ошибка мониторинга потоковых данных: {e}")
+                await asyncio.sleep(60)
+
+    async def _subscription_retry_manager(self):
+        """Менеджер повторных попыток подписки для неудачных пар"""
+        while self.is_running:
+            try:
+                await asyncio.sleep(self.subscription_retry_interval)
+
+                if not self.is_running or not self.websocket_connected:
+                    continue
+
+                # Проверяем пары, которые не получают данные
+                current_time = datetime.utcnow()
+                pairs_to_retry = set()
+
+                # Добавляем пары из failed_subscriptions
+                pairs_to_retry.update(self.failed_subscriptions)
+
+                # Добавляем пары, которые давно не получали данные
+                for symbol in self.trading_pairs:
+                    last_data_time = self.last_stream_data.get(symbol)
+                    if not last_data_time or (current_time - last_data_time).total_seconds() > self.force_reconnect_timeout:
+                        pairs_to_retry.add(symbol)
+
+                if pairs_to_retry:
+                    logger.info(f"🔄 Повторная попытка подписки для {len(pairs_to_retry)} пар: {list(pairs_to_retry)[:5]}...")
+                    
+                    # Пытаемся переподписаться
+                    await self._subscribe_to_pairs(pairs_to_retry)
+                    
+                    # Очищаем список неудачных подписок (они будут добавлены обратно, если снова не сработают)
+                    self.failed_subscriptions.clear()
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка менеджера повторных подписок: {e}")
                 await asyncio.sleep(60)
 
     async def _subscription_updater(self):
@@ -685,6 +775,19 @@ class BybitWebSocketClient:
                 # Обновляем локальный список
                 self.trading_pairs.update(new_pairs)
                 self.trading_pairs -= removed_pairs
+
+                # Инициализируем статистику для новых пар
+                for symbol in new_pairs:
+                    self.pair_statistics[symbol] = {
+                        'messages': 0,
+                        'last_message': None,
+                        'errors': 0,
+                        'subscription_attempts': 0
+                    }
+
+                # Удаляем статистику для удаленных пар
+                for symbol in removed_pairs:
+                    self.pair_statistics.pop(symbol, None)
 
                 # Загружаем данные для новых пар
                 if new_pairs:
@@ -866,7 +969,7 @@ class BybitWebSocketClient:
                 logger.error(f"❌ Ошибка задачи очистки данных: {e}")
 
     async def _handle_message(self, data: Dict):
-        """Обработка входящих WebSocket сообщений"""
+        """Обработка входящих WebSocket сообщений с улучшенной диагностикой"""
         try:
             # Обрабатываем системные сообщения
             if 'success' in data:
@@ -892,9 +995,20 @@ class BybitWebSocketClient:
                     logger.debug(f"📊 Получены данные для символа {symbol}, которого нет в watchlist")
                     return
 
+                # Обновляем статистику для пары
+                if symbol in self.pair_statistics:
+                    self.pair_statistics[symbol]['messages'] += 1
+                    self.pair_statistics[symbol]['last_message'] = datetime.utcnow()
+
                 # Добавляем символ в подписанные (если получили данные, значит подписка работает)
                 if symbol in self.subscription_pending:
                     self.subscription_pending.remove(symbol)
+                    logger.debug(f"✅ Подтверждена подписка для {symbol}")
+                
+                if symbol in self.failed_subscriptions:
+                    self.failed_subscriptions.remove(symbol)
+                    logger.info(f"✅ Восстановлена подписка для {symbol}")
+                
                 self.subscribed_pairs.add(symbol)
 
                 # Обновляем время последних потоковых данных
@@ -947,6 +1061,9 @@ class BybitWebSocketClient:
 
         except Exception as e:
             logger.error(f"❌ Ошибка обработки kline данных: {e}")
+            # Обновляем статистику ошибок для пары
+            if 'symbol' in locals() and symbol in self.pair_statistics:
+                self.pair_statistics[symbol]['errors'] += 1
 
     async def _process_closed_candle(self, symbol: str, formatted_data: Dict):
         """Обработка закрытой свечи"""
@@ -1017,33 +1134,22 @@ class BybitWebSocketClient:
         self.websocket_connected = False
         self.streaming_active = False
         
-        if self.ping_task:
-            self.ping_task.cancel()
-            try:
-                await self.ping_task
-            except asyncio.CancelledError:
-                pass
-                
-        if self.subscription_update_task:
-            self.subscription_update_task.cancel()
-            try:
-                await self.subscription_update_task
-            except asyncio.CancelledError:
-                pass
-
-        if self.data_range_manager_task:
-            self.data_range_manager_task.cancel()
-            try:
-                await self.data_range_manager_task
-            except asyncio.CancelledError:
-                pass
-
-        if self.stream_monitor_task:
-            self.stream_monitor_task.cancel()
-            try:
-                await self.stream_monitor_task
-            except asyncio.CancelledError:
-                pass
+        # Останавливаем все задачи
+        tasks_to_cancel = [
+            self.ping_task,
+            self.subscription_update_task,
+            self.data_range_manager_task,
+            self.stream_monitor_task,
+            self.subscription_retry_task
+        ]
+        
+        for task in tasks_to_cancel:
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
                 
         if self.websocket:
             try:
@@ -1054,11 +1160,37 @@ class BybitWebSocketClient:
         logger.info("🛑 WebSocket клиент остановлен")
 
     def get_subscription_stats(self) -> Dict:
-        """Получить статистику подписок"""
+        """Получить расширенную статистику подписок"""
+        current_time = datetime.utcnow()
+        
+        # Подсчитываем активные потоки
+        active_streams = 0
+        for symbol, last_time in self.last_stream_data.items():
+            if last_time and (current_time - last_time).total_seconds() < self.stream_timeout_seconds:
+                active_streams += 1
+        
+        # Статистика по парам
+        pair_stats = {}
+        for symbol, stats in self.pair_statistics.items():
+            last_message_age = None
+            if stats['last_message']:
+                last_message_age = (current_time - stats['last_message']).total_seconds()
+            
+            pair_stats[symbol] = {
+                'messages': stats['messages'],
+                'last_message_age_seconds': last_message_age,
+                'errors': stats['errors'],
+                'subscription_attempts': stats['subscription_attempts'],
+                'is_active': symbol in self.last_stream_data and 
+                           self.last_stream_data[symbol] and 
+                           (current_time - self.last_stream_data[symbol]).total_seconds() < self.stream_timeout_seconds
+            }
+
         return {
             'total_pairs': len(self.trading_pairs),
             'subscribed_pairs': len(self.subscribed_pairs),
             'pending_pairs': len(self.subscription_pending),
+            'failed_subscriptions': len(self.failed_subscriptions),
             'last_update': self.last_subscription_update.isoformat() if self.last_subscription_update else None,
             'subscription_rate': len(self.subscribed_pairs) / len(
                 self.trading_pairs) * 100 if self.trading_pairs else 0,
@@ -1069,6 +1201,8 @@ class BybitWebSocketClient:
             'reconnect_attempts': self.reconnect_attempts,
             'max_reconnect_attempts': self.max_reconnect_attempts,
             'messages_received': self.messages_received,
-            'active_streams': len([s for s, t in self.last_stream_data.items() 
-                                 if (datetime.utcnow() - t).total_seconds() < self.stream_timeout_seconds])
+            'active_streams': active_streams,
+            'inactive_streams': len(self.trading_pairs) - active_streams,
+            'pair_statistics': pair_stats,
+            'failed_subscription_list': list(self.failed_subscriptions)
         }
