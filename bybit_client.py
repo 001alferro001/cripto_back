@@ -43,6 +43,7 @@ class BybitWebSocketClient:
         # Флаги состояния
         self.data_loading_complete = False
         self.initial_subscription_complete = False
+        self.streaming_active = False  # Новый флаг для отслеживания активности потока
 
         # Настройки переподключения
         self.reconnect_attempts = 0
@@ -65,6 +66,11 @@ class BybitWebSocketClient:
         self.min_integrity_for_skip = 90  # Минимальная целостность для пропуска загрузки
         self.min_candles_for_skip = 50   # Минимальное количество свечей для пропуска загрузки
 
+        # Мониторинг потоковых данных
+        self.last_stream_data = {}  # symbol -> timestamp последних данных
+        self.stream_timeout_seconds = 120  # Таймаут для потоковых данных
+        self.stream_monitor_task = None
+
     async def start(self):
         """Запуск WebSocket соединения с правильной очередностью"""
         self.is_running = True
@@ -86,6 +92,10 @@ class BybitWebSocketClient:
             # Шаг 4: Запускаем периодические задачи
             logger.info("⚙️ Шаг 4: Запуск периодических задач...")
             await self._start_periodic_tasks()
+
+            # Шаг 5: Запускаем мониторинг потоковых данных
+            logger.info("📡 Шаг 5: Запуск мониторинга потоковых данных...")
+            await self._start_stream_monitoring()
 
             logger.info("✅ Система мониторинга успешно запущена!")
 
@@ -148,6 +158,14 @@ class BybitWebSocketClient:
 
             self.data_loading_complete = True
             logger.info("✅ Проверка и загрузка исторических данных завершена")
+
+            # Уведомляем о готовности к потоковым данным
+            await self.connection_manager.broadcast_json({
+                "type": "historical_data_loaded",
+                "pairs_count": len(self.trading_pairs),
+                "ready_for_streaming": True,
+                "timestamp": datetime.utcnow().isoformat()
+            })
 
         except Exception as e:
             logger.error(f"❌ Ошибка проверки и загрузки исторических данных: {e}")
@@ -400,6 +418,20 @@ class BybitWebSocketClient:
 
         logger.info("✅ WebSocket соединение установлено")
 
+        # Ждем завершения подписки на все пары
+        max_subscription_wait = 60  # максимум 60 секунд
+        subscription_wait = 0
+        while len(self.subscribed_pairs) < len(self.trading_pairs) and subscription_wait < max_subscription_wait:
+            await asyncio.sleep(1)
+            subscription_wait += 1
+            logger.debug(f"📡 Подписка: {len(self.subscribed_pairs)}/{len(self.trading_pairs)} пар")
+
+        if len(self.subscribed_pairs) == len(self.trading_pairs):
+            logger.info(f"✅ Подписка завершена на все {len(self.subscribed_pairs)} пар")
+            self.initial_subscription_complete = True
+        else:
+            logger.warning(f"⚠️ Подписка частично завершена: {len(self.subscribed_pairs)}/{len(self.trading_pairs)} пар")
+
     async def _websocket_connection_loop(self):
         """Основной цикл WebSocket соединения с улучшенной обработкой переподключений"""
         while self.is_running:
@@ -411,6 +443,7 @@ class BybitWebSocketClient:
             except Exception as e:
                 logger.error(f"❌ WebSocket ошибка: {e}")
                 self.websocket_connected = False
+                self.streaming_active = False
                 
                 if self.is_running:
                     self.reconnect_attempts += 1
@@ -460,11 +493,15 @@ class BybitWebSocketClient:
                     "subscribed_count": len(self.subscribed_pairs),
                     "pending_count": len(self.subscription_pending),
                     "update_interval": self.update_interval,
+                    "streaming_active": True,
                     "timestamp": datetime.utcnow().isoformat()
                 })
 
                 # Запускаем задачу мониторинга соединения
                 self.ping_task = asyncio.create_task(self._monitor_connection())
+
+                # Устанавливаем флаг активности потока
+                self.streaming_active = True
 
                 # Обработка входящих сообщений
                 async for message in websocket:
@@ -502,6 +539,7 @@ class BybitWebSocketClient:
             raise
         finally:
             self.websocket_connected = False
+            self.streaming_active = False
             if self.ping_task:
                 self.ping_task.cancel()
                 try:
@@ -551,6 +589,58 @@ class BybitWebSocketClient:
 
         # Задача очистки данных
         asyncio.create_task(self._data_cleanup_task())
+
+    async def _start_stream_monitoring(self):
+        """Запуск мониторинга потоковых данных"""
+        self.stream_monitor_task = asyncio.create_task(self._stream_monitor())
+        logger.info("📡 Мониторинг потоковых данных запущен")
+
+    async def _stream_monitor(self):
+        """Мониторинг активности потоковых данных"""
+        while self.is_running:
+            try:
+                await asyncio.sleep(30)  # Проверяем каждые 30 секунд
+
+                if not self.is_running:
+                    break
+
+                current_time = datetime.utcnow()
+                inactive_pairs = []
+
+                # Проверяем активность потоковых данных для каждой пары
+                for symbol in self.trading_pairs:
+                    last_data_time = self.last_stream_data.get(symbol)
+                    
+                    if last_data_time:
+                        time_since_last = (current_time - last_data_time).total_seconds()
+                        
+                        if time_since_last > self.stream_timeout_seconds:
+                            inactive_pairs.append(symbol)
+                            logger.warning(f"⚠️ Нет потоковых данных для {symbol} уже {time_since_last:.0f} секунд")
+
+                # Отправляем статистику потоковых данных
+                streaming_stats = {
+                    "type": "streaming_status",
+                    "active_pairs": len(self.trading_pairs) - len(inactive_pairs),
+                    "inactive_pairs": len(inactive_pairs),
+                    "total_pairs": len(self.trading_pairs),
+                    "websocket_connected": self.websocket_connected,
+                    "streaming_active": self.streaming_active,
+                    "messages_received": self.messages_received,
+                    "timestamp": current_time.isoformat()
+                }
+
+                await self.connection_manager.broadcast_json(streaming_stats)
+
+                # Если слишком много неактивных пар, пытаемся переподключиться
+                if len(inactive_pairs) > len(self.trading_pairs) * 0.5:  # Более 50% пар неактивны
+                    logger.error(f"❌ Слишком много неактивных пар ({len(inactive_pairs)}/{len(self.trading_pairs)}). Переподключение...")
+                    if self.websocket:
+                        await self.websocket.close()
+
+            except Exception as e:
+                logger.error(f"❌ Ошибка мониторинга потоковых данных: {e}")
+                await asyncio.sleep(60)
 
     async def _subscription_updater(self):
         """Периодическое обновление подписок на новые пары"""
@@ -641,6 +731,10 @@ class BybitWebSocketClient:
                 # Обновляем отслеживание подписок
                 self.subscribed_pairs -= removed_pairs
 
+                # Удаляем из мониторинга потоковых данных
+                for pair in removed_pairs:
+                    self.last_stream_data.pop(pair, None)
+
             # Подписываемся на новые пары
             if new_pairs:
                 await self._subscribe_to_pairs(new_pairs)
@@ -652,6 +746,7 @@ class BybitWebSocketClient:
                 "subscribed_pairs": len(self.subscribed_pairs),
                 "new_pairs": list(new_pairs),
                 "removed_pairs": list(removed_pairs),
+                "streaming_active": self.streaming_active,
                 "timestamp": datetime.utcnow().isoformat()
             })
 
@@ -802,6 +897,9 @@ class BybitWebSocketClient:
                     self.subscription_pending.remove(symbol)
                 self.subscribed_pairs.add(symbol)
 
+                # Обновляем время последних потоковых данных
+                self.last_stream_data[symbol] = datetime.utcnow()
+
                 # Биржа передает время в миллисекундах
                 start_time_ms = int(kline_data['start'])
                 end_time_ms = int(kline_data['end'])
@@ -839,6 +937,7 @@ class BybitWebSocketClient:
                     "data": formatted_data,
                     "timestamp": datetime.utcnow().isoformat(),
                     "is_closed": is_closed,
+                    "streaming_active": self.streaming_active,
                     "server_timestamp": self.alert_manager._get_current_timestamp_ms() if hasattr(self.alert_manager,
                                                                                                   '_get_current_timestamp_ms') else int(
                         datetime.utcnow().timestamp() * 1000)
@@ -892,12 +991,14 @@ class BybitWebSocketClient:
                             "type": "connection_status",
                             "status": "warning",
                             "reason": f"No messages for {time_since_last_message:.0f} seconds",
+                            "streaming_active": False,
                             "timestamp": current_time.isoformat()
                         })
 
                         # Если нет сообщений более 2 минут, принудительно переподключаемся
                         if time_since_last_message > 120:
                             logger.error("❌ Принудительное переподключение из-за отсутствия сообщений")
+                            self.streaming_active = False
                             break
 
                 # Проверяем стабильность соединения
@@ -914,6 +1015,7 @@ class BybitWebSocketClient:
         """Остановка WebSocket соединения"""
         self.is_running = False
         self.websocket_connected = False
+        self.streaming_active = False
         
         if self.ping_task:
             self.ping_task.cancel()
@@ -933,6 +1035,13 @@ class BybitWebSocketClient:
             self.data_range_manager_task.cancel()
             try:
                 await self.data_range_manager_task
+            except asyncio.CancelledError:
+                pass
+
+        if self.stream_monitor_task:
+            self.stream_monitor_task.cancel()
+            try:
+                await self.stream_monitor_task
             except asyncio.CancelledError:
                 pass
                 
@@ -956,6 +1065,10 @@ class BybitWebSocketClient:
             'data_loading_complete': self.data_loading_complete,
             'initial_subscription_complete': self.initial_subscription_complete,
             'websocket_connected': self.websocket_connected,
+            'streaming_active': self.streaming_active,
             'reconnect_attempts': self.reconnect_attempts,
-            'max_reconnect_attempts': self.max_reconnect_attempts
+            'max_reconnect_attempts': self.max_reconnect_attempts,
+            'messages_received': self.messages_received,
+            'active_streams': len([s for s, t in self.last_stream_data.items() 
+                                 if (datetime.utcnow() - t).total_seconds() < self.stream_timeout_seconds])
         }
