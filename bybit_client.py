@@ -481,28 +481,36 @@ class BybitWebSocketClient:
                 removed_pairs = self.trading_pairs - current_pairs
 
                 if new_pairs or removed_pairs:
-                    logger.info(f"📋 Обновление списка пар: +{len(new_pairs)} новых, -{len(removed_pairs)} удаленных")
-
-                    # Обновляем локальный список
-                    self.trading_pairs = current_pairs.copy()
-
-                    # Загружаем данные для новых пар
-                    if new_pairs:
-                        await self._load_data_for_new_pairs(new_pairs)
-
-                    # Если WebSocket активен, обновляем подписки
-                    if self.websocket_connected:
-                        await self._update_subscriptions(new_pairs, removed_pairs)
-
-                    logger.info("✅ Обновление списка пар завершено")
-                else:
-                    logger.debug("📋 Список торговых пар не изменился")
+                    await self.handle_pairs_update(new_pairs, removed_pairs)
 
                 self.last_subscription_update = datetime.utcnow()
 
             except Exception as e:
                 logger.error(f"❌ Ошибка периодической проверки пар: {e}")
                 await asyncio.sleep(60)  # При ошибке ждем 1 минуту
+
+    async def handle_pairs_update(self, new_pairs: Set[str], removed_pairs: Set[str]):
+        """Обработка обновления списка пар (может быть вызвана извне)"""
+        try:
+            if new_pairs or removed_pairs:
+                logger.info(f"📋 Обновление списка пар: +{len(new_pairs)} новых, -{len(removed_pairs)} удаленных")
+
+                # Обновляем локальный список
+                self.trading_pairs.update(new_pairs)
+                self.trading_pairs -= removed_pairs
+
+                # Загружаем данные для новых пар
+                if new_pairs:
+                    await self._load_data_for_new_pairs(new_pairs)
+
+                # Если WebSocket активен, обновляем подписки
+                if self.websocket_connected:
+                    await self._update_subscriptions(new_pairs, removed_pairs)
+
+                logger.info("✅ Обновление списка пар завершено")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка обработки обновления пар: {e}")
 
     async def _load_data_for_new_pairs(self, new_pairs: Set[str]):
         """Загрузка исторических данных для новых пар"""

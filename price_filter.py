@@ -22,6 +22,12 @@ class PriceFilter:
             'pairs_check_interval_minutes': int(os.getenv('PAIRS_CHECK_INTERVAL_MINUTES', 30))
         }
         self.is_running = False
+        # Добавляем callback для уведомления о новых парах
+        self.on_pairs_updated_callback = None
+
+    def set_pairs_updated_callback(self, callback):
+        """Установить callback для уведомления о новых парах"""
+        self.on_pairs_updated_callback = callback
 
     async def start(self):
         """Запуск периодической проверки торговых пар"""
@@ -120,6 +126,7 @@ class PriceFilter:
             new_watchlist = []
             added_count = 0
             removed_count = 0
+            new_pairs = set()  # Отслеживаем новые пары
 
             logger.info(f"📊 Проверка {len(pairs)} торговых пар...")
 
@@ -138,6 +145,7 @@ class PriceFilter:
                                     symbol, price_drop, current_price, historical_price
                                 )
                                 added_count += 1
+                                new_pairs.add(symbol)  # Добавляем в список новых пар
                                 logger.info(f"➕ Добавлена пара {symbol} в watchlist (падение цены: {price_drop:.2f}%)")
 
                     # Задержка для избежания ограничений API
@@ -158,6 +166,15 @@ class PriceFilter:
                     logger.info(f"➖ Удалена пара {symbol} из watchlist (не соответствует критериям)")
 
             logger.info(f"✅ Watchlist обновлен: {len(new_watchlist)} активных пар (+{added_count}, -{removed_count})")
+
+            # Уведомляем о новых парах через callback
+            if new_pairs and self.on_pairs_updated_callback:
+                logger.info(f"📢 Уведомляем о {len(new_pairs)} новых парах через callback")
+                try:
+                    await self.on_pairs_updated_callback(new_pairs, set())
+                except Exception as e:
+                    logger.error(f"❌ Ошибка вызова callback для новых пар: {e}")
+
             return new_watchlist
 
         except Exception as e:

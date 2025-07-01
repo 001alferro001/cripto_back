@@ -171,6 +171,14 @@ async def lifespan(app: FastAPI):
         # Инициализация WebSocket клиента Bybit (без торговых пар - они загрузятся автоматически)
         bybit_client = BybitWebSocketClient([], alert_manager, manager)
 
+        # Настраиваем callback для немедленного обновления пар
+        async def on_pairs_updated(new_pairs, removed_pairs):
+            """Callback для немедленного обновления пар в bybit_client"""
+            if bybit_client:
+                await bybit_client.handle_pairs_update(new_pairs, removed_pairs)
+
+        price_filter.set_pairs_updated_callback(on_pairs_updated)
+
         # Запуск всех сервисов в правильном порядке
         logger.info("🔄 Запуск сервисов...")
 
